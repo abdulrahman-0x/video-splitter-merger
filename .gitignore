@@ -1,0 +1,41 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Binaries
+bin/
+*.exe
+*.dll
+
+# Logs
+logs/
+*.log
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+test_output/
+tmp/
+
+# Temporary media output from tests or processing
+*.partial.*
+*_parts/
+*_parts_*/
+*_merged.mp4
+*_merged.mkv
+*_merged.mov
+*_merged.avi
+
+# IDE
+.vscode/
+.idea/
