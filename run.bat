@@ -1,51 +1,57 @@
 @echo off
-chcp 65001 >nul
-title Video Splitter & Merger
-
+setlocal
 cd /d "%~dp0"
+title Video Splitter and Merger
 
-:: Check for Python
+REM 1. Check for Python
 where python >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    echo.
-    echo [خطأ] لم يتم العثور على بايثون (Python) في النظام.
-    echo [Error] Python was not found on your system.
-    echo.
-    echo يرجى تثبيت Python 3.10 أو أحدث وتفعيل خيار "Add Python to PATH" أثناء التثبيت.
-    echo Please install Python 3.10 or newer and check "Add Python to PATH".
-    echo https://www.python.org/downloads/
-    echo.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto NoPython
 
-:: Create Virtual Environment if not exists
-if not exist ".venv\Scripts\python.exe" (
-    echo [1/2] جاري إنشاء البيئة الافتراضية (.venv)...
-    python -m venv .venv
-    if %ERRORLEVEL% neq 0 (
-        echo [خطأ] فشل إنشاء البيئة الافتراضية.
-        pause
-        exit /b 1
-    )
-    echo [2/2] جاري تثبيت الحزم المطلوبة...
-    ".venv\Scripts\python.exe" -m pip install --upgrade pip
-    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-    if %ERRORLEVEL% neq 0 (
-        echo [خطأ] فشل تثبيت الحزم المطلوبة.
-        pause
-        exit /b 1
-    )
-    echo تم التثبيت بنجاح.
-) else (
-    :: Quick verification of dependencies
-    ".venv\Scripts\python.exe" -c "import customtkinter" >nul 2>&1
-    if %ERRORLEVEL% neq 0 (
-        echo جاري استكمال تثبيت الحزم المطلوبة...
-        ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-    )
-)
+REM 2. Check if virtual environment exists
+if exist "%~dp0.venv\Scripts\python.exe" goto CheckDeps
 
-:: Launch application with pythonw (no black console window)
-start "" ".venv\Scripts\pythonw.exe" -m src.main
+echo [1/2] Creating virtual environment...
+python -m venv "%~dp0.venv"
+if errorlevel 1 goto VenvError
+
+echo [2/2] Installing dependencies...
+"%~dp0.venv\Scripts\python.exe" -m pip install --upgrade pip
+"%~dp0.venv\Scripts\python.exe" -m pip install -r "%~dp0requirements.txt"
+if errorlevel 1 goto PipError
+goto LaunchApp
+
+:CheckDeps
+"%~dp0.venv\Scripts\python.exe" -c "import customtkinter" >nul 2>&1
+if not errorlevel 1 goto LaunchApp
+
+echo Installing dependencies...
+"%~dp0.venv\Scripts\python.exe" -m pip install -r "%~dp0requirements.txt"
+if errorlevel 1 goto PipError
+
+:LaunchApp
+start "" "%~dp0.venv\Scripts\pythonw.exe" -m src.main
 exit /b 0
+
+:NoPython
+echo.
+echo [ERROR] Python was not found in PATH.
+echo Please install Python 3.10 or newer from:
+echo https://www.python.org/downloads/
+echo Make sure to check 'Add Python to PATH' during installation.
+echo.
+pause
+exit /b 1
+
+:VenvError
+echo.
+echo [ERROR] Failed to create virtual environment.
+echo.
+pause
+exit /b 1
+
+:PipError
+echo.
+echo [ERROR] Failed to install required packages.
+echo.
+pause
+exit /b 1
