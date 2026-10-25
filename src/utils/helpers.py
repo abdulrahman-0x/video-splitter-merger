@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any, Tuple
@@ -47,6 +48,9 @@ def parse_duration_minutes(text: str, min_seconds: float = 10.0) -> float:
     try:
         minutes = float(normalized)
     except ValueError:
+        raise ValueError(f"قيمة المدة غير صالحة: '{text}'. يرجى إدخال رقم صحيح أو عشري.")
+
+    if not math.isfinite(minutes) or math.isnan(minutes):
         raise ValueError(f"قيمة المدة غير صالحة: '{text}'. يرجى إدخال رقم صحيح أو عشري.")
 
     if minutes <= 0:
