@@ -26,6 +26,8 @@ build/
 htmlcov/
 test_output/
 tmp/
+tests/video test/
+tests/**/*.mp4
 
 # Temporary media output from tests or processing
 *.partial.*

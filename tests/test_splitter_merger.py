@@ -68,6 +68,12 @@ class TestSplitterMergerUnit:
         with pytest.raises(ValueError, match="جزأين على الأقل"):
             parse_concat_list(list_file)
 
+    def test_parse_concat_list_missing_referenced_file_raises_error(self, tmp_path: Path) -> None:
+        list_file = tmp_path / "parts_list.txt"
+        list_file.write_text("file 'nonexistent_part_1.mp4'\nfile 'nonexistent_part_2.mp4'\n", encoding="utf-8")
+        with pytest.raises(FileNotFoundError, match="غير موجود"):
+            parse_concat_list(list_file)
+
 
 class TestSplitterMergerIntegration:
     """Integration tests executing FFmpeg on synthetic videos."""
@@ -271,4 +277,72 @@ class TestSplitterMergerIntegration:
 
         # Direct compatibility check
         with pytest.raises(ValueError, match="اختلاف أبعاد الفيديو"):
+            verify_parts_compatibility([v1, v2], ffprobe_bin=ffprobe_bin)
+
+    def test_split_rejects_segment_duration_exceeding_total_media_duration(
+        self, require_ffmpeg: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        ffmpeg_bin, ffprobe_bin = require_ffmpeg
+        video = tmp_path / "short_sample.mp4"
+        create_synthetic_video(video, ffmpeg_path=ffmpeg_bin, duration_sec=15)
+
+        splitter = VideoSplitter()
+        # Segment duration 30s > 15s total
+        with pytest.raises(ValueError, match="الفيديو أقصر من مدة التقسيم"):
+            splitter.split(
+                input_path=video,
+                segment_duration_sec=30.0,
+                ffmpeg_exe=ffmpeg_bin,
+                ffprobe_exe=ffprobe_bin,
+            )
+
+    def test_split_cancellation_cleans_up_created_directory(
+        self, require_ffmpeg: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        ffmpeg_bin, ffprobe_bin = require_ffmpeg
+        video = tmp_path / "cancel_test.mp4"
+        create_synthetic_video(video, ffmpeg_path=ffmpeg_bin, duration_sec=30)
+
+        splitter = VideoSplitter()
+
+        # Cancel immediately on first progress callback
+        def cancel_on_progress(pct: float, cur_sec: float) -> None:
+            splitter.cancel()
+
+        with pytest.raises(InterruptedError, match="تم إلغاء العملية"):
+            splitter.split(
+                input_path=video,
+                segment_duration_sec=5.0,
+                progress_callback=cancel_on_progress,
+                ffmpeg_exe=ffmpeg_bin,
+                ffprobe_exe=ffprobe_bin,
+            )
+
+        # Expected parts folder should have been cleaned up and removed
+        expected_parts_dir = tmp_path / "cancel_test_parts"
+        assert not expected_parts_dir.exists()
+
+    def test_merge_rejects_audio_channel_mismatch(
+        self, require_ffmpeg: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        ffmpeg_bin, ffprobe_bin = require_ffmpeg
+
+        # Video 1: Mono audio (1 channel)
+        v1 = tmp_path / "audio_mono.mp4"
+        create_synthetic_video(v1, ffmpeg_path=ffmpeg_bin, duration_sec=5)
+
+        # Video 2: Stereo audio (2 channels)
+        v2 = tmp_path / "audio_stereo.mp4"
+        cmd = [
+            str(ffmpeg_bin),
+            "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=5:size=320x240:rate=25",
+            "-f", "lavfi", "-i", "sine=duration=5",
+            "-c:v", "libx264", "-c:a", "aac", "-ac", "2",
+            str(v2),
+        ]
+        import subprocess
+        subprocess.run(cmd, check=True, creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0)
+
+        with pytest.raises(ValueError, match="اختلاف قنوات الصوت"):
             verify_parts_compatibility([v1, v2], ffprobe_bin=ffprobe_bin)
