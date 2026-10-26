@@ -125,3 +125,71 @@ def create_synthetic_video(
         )
 
     return output_path
+
+
+def create_synthetic_audio(
+    output_path: Path,
+    ffmpeg_path: Path,
+    duration_sec: int = 30,
+    frequency: int = 1000,
+    sample_rate: int = 44100,
+    channels: int = 2,
+    with_cover_art: bool = False,
+) -> Path:
+    """Generate a synthetic audio test file (wav, mp3, flac, m4a, ogg)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ext = output_path.suffix.lower()
+
+    cmd = [
+        str(ffmpeg_path),
+        "-y",
+        "-f", "lavfi",
+        "-i", f"sine=frequency={frequency}:duration={duration_sec}:sample_rate={sample_rate}",
+    ]
+
+    if with_cover_art:
+        # Create a tiny 1-frame dummy image as album cover
+        cmd += [
+            "-f", "lavfi",
+            "-i", "color=c=blue:s=120x120:d=1",
+        ]
+
+    # Select codec based on extension
+    if ext == ".wav":
+        codec_args = ["-c:a", "pcm_s16le"]
+    elif ext == ".mp3":
+        codec_args = ["-c:a", "libmp3lame", "-b:a", "192k"]
+    elif ext == ".flac":
+        codec_args = ["-c:a", "flac"]
+    elif ext in (".m4a", ".aac"):
+        codec_args = ["-c:a", "aac", "-b:a", "192k"]
+    elif ext in (".ogg", ".opus"):
+        codec_args = ["-c:a", "libopus", "-b:a", "128k"]
+    else:
+        codec_args = ["-c:a", "pcm_s16le"]
+
+    cmd.extend(codec_args)
+    cmd.extend(["-ac", str(channels)])
+
+    if with_cover_art:
+        cmd.extend([
+            "-map", "0:a",
+            "-map", "1:v",
+            "-c:v", "mjpeg",
+            "-disposition:v:0", "attached_pic",
+        ])
+
+    cmd.append(str(output_path))
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"فشل توليد ملف الصوت التجريبي بـ FFmpeg:\n{proc.stderr.decode('utf-8', errors='ignore')}"
+        )
+
+    return output_path

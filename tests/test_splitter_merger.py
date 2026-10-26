@@ -288,7 +288,7 @@ class TestSplitterMergerIntegration:
 
         splitter = VideoSplitter()
         # Segment duration 30s > 15s total
-        with pytest.raises(ValueError, match="الفيديو أقصر من مدة التقسيم"):
+        with pytest.raises(ValueError, match="(الفيديو|الملف) أقصر من مدة التقسيم"):
             splitter.split(
                 input_path=video,
                 segment_duration_sec=30.0,

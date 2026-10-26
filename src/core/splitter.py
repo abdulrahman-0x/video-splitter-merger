@@ -40,7 +40,7 @@ class PartInfo:
 
 @dataclass
 class SplitResult:
-    """Result of a successful video split operation."""
+    """Result of a successful video or audio split operation."""
     parts_dir: Path
     parts: List[PartInfo]
     parts_list_file: Path
@@ -49,17 +49,35 @@ class SplitResult:
     has_deviation_warning: bool = False
     warning_message: str = ""
     created_files: List[Path] = field(default_factory=list)
+    is_audio_only: bool = False
 
 
-def build_stream_map(streams: List[dict], container_suffix: str) -> List[str]:
+def build_stream_map(
+    streams: List[dict],
+    container_suffix: str,
+    is_audio_only: bool = False,
+) -> List[str]:
     """Build FFmpeg -map arguments for video, audio, and subtitle streams.
 
     Explicitly excludes data streams (like timecode or GoPro GPS) to prevent MP4 muxer errors.
     Allows attachments for MKV containers.
+    For audio-only files, drops video (including cover art) and maps only audio streams.
     """
     map_args: List[str] = []
-    is_mkv = container_suffix.lower() == ".mkv"
 
+    if is_audio_only:
+        audio_indices = [
+            s.get("index") for s in streams
+            if s.get("codec_type") == "audio" and s.get("index") is not None
+        ]
+        if audio_indices:
+            map_args = ["-vn"]
+            for idx in audio_indices:
+                map_args.extend(["-map", f"0:{idx}"])
+            return map_args
+        return ["-vn", "-map", "0:a"]
+
+    is_mkv = container_suffix.lower() == ".mkv"
     allowed_types = {"video", "audio", "subtitle"}
     if is_mkv:
         allowed_types.add("attachment")
@@ -106,14 +124,14 @@ class VideoSplitter:
         """
         source_path = Path(input_path).resolve()
         if not source_path.is_file():
-            raise FileNotFoundError(f"ملف الفيديو غير موجود: {source_path}")
+            raise FileNotFoundError(f"ملف الوسائط غير موجود: {source_path}")
 
         # 1. Format verification
         supported, status = check_supported_format(source_path)
         if not supported:
             raise ValueError(
-                f"صيغة الفيديو '{source_path.suffix}' غير مدعومة. "
-                "الصيغ المدعومة هي: MP4, MKV, MOV (وصيغة AVI بدعم تجريبي)."
+                f"صيغة الملف '{source_path.suffix}' غير مدعومة. "
+                "الصيغ المدعومة هي: MP4, MKV, MOV, WAV, MP3, M4A, FLAC (وصيغ AVI, AAC, OGG, OPUS بدعم تجريبي)."
             )
 
         # 2. Tools verification
@@ -126,12 +144,12 @@ class VideoSplitter:
         probe_data = probe_media(source_path, ffprobe_path=ffprobe_bin)
         total_duration = probe_data["duration"]
         if total_duration <= 0.0:
-            raise ValueError("تعذر تحديد مدة الفيديو أو أن مدته تساوي صفراً.")
+            raise ValueError("تعذر تحديد مدة الملف أو أن مدته تساوي صفراً.")
 
         if segment_duration_sec >= total_duration:
             raise ValueError(
-                f"الفيديو أقصر من مدة التقسيم المحددة ({format_duration(segment_duration_sec)}).\n"
-                f"مدة الفيديو الإجمالية: {format_duration(total_duration)}."
+                f"الملف أقصر من مدة التقسيم المحددة ({format_duration(segment_duration_sec)}).\n"
+                f"مدة الملف الإجمالية: {format_duration(total_duration)}."
             )
 
         # 4. Storage and path checks
@@ -140,7 +158,7 @@ class VideoSplitter:
         has_space, free_bytes, _ = check_free_space(dest_base_dir, source_size)
         if not has_space:
             raise RuntimeError(
-                f"المساحة الحرة على القرص غير كافية لتقسيم الفيديو.\n"
+                f"المساحة الحرة على القرص غير كافية لتقسيم الملف.\n"
                 f"المطلوب: {source_size / (1024*1024):.1f} ميجابايت، المتوفر: {free_bytes / (1024*1024):.1f} ميجابايت."
             )
 
@@ -156,14 +174,33 @@ class VideoSplitter:
         dir_created_by_us = True
         created_files: List[Path] = []
 
-        # 5. Build naming pattern and command
-        expected_parts_count = math.ceil(total_duration / segment_duration_sec)
+        # 5. Build cut points, naming pattern and command
+        # Calculate split cut points while avoiding trailing micro-stubs (< min_remainder)
+        min_remainder = min(1.0, segment_duration_sec * 0.1)
+        cut_points: List[float] = []
+        cur = segment_duration_sec
+        while cur < total_duration - min_remainder:
+            cut_points.append(cur)
+            cur += segment_duration_sec
+
+        expected_parts_count = len(cut_points) + 1 if cut_points else math.ceil(total_duration / segment_duration_sec)
         pad_width = calculate_padding_width(expected_parts_count)
         part_name_pattern = f"{source_path.stem}_part_%0{pad_width}d{source_path.suffix}"
         part_pattern_path = target_parts_dir / part_name_pattern
 
         segment_list_csv = target_parts_dir / "segments_temp.csv"
-        map_args = build_stream_map(probe_data["all_streams"], source_path.suffix)
+        is_audio = probe_data.get("is_audio_only", False)
+        map_args = build_stream_map(
+            probe_data["all_streams"],
+            source_path.suffix,
+            is_audio_only=is_audio,
+        )
+
+        if cut_points:
+            times_str = ",".join(f"{t:.6f}".rstrip("0").rstrip(".") for t in cut_points)
+            seg_timing_args = ["-segment_times", times_str]
+        else:
+            seg_timing_args = ["-segment_time", str(segment_duration_sec)]
 
         cmd = [
             str(ffmpeg_bin),
@@ -172,7 +209,7 @@ class VideoSplitter:
             "-c", "copy",
             *map_args,
             "-f", "segment",
-            "-segment_time", str(segment_duration_sec),
+            *seg_timing_args,
             "-reset_timestamps", "1",
             "-segment_list", str(segment_list_csv),
             "-segment_list_type", "csv",
@@ -266,11 +303,18 @@ class VideoSplitter:
             dev = abs(part.duration - segment_duration_sec)
             if dev > max_deviation_thresh:
                 has_deviation_warning = True
-                warning_msg = (
-                    f"ملاحظة: تباعد إطارات الـ Keyframes في الفيديو أدى إلى اختلاف مدة الجزء {i} "
-                    f"({format_duration(part.duration)}) عن المدة المطلوبة "
-                    f"بمقدار {dev:.1f} ثانية (أكبر من الحد {max_deviation_thresh:.1f} ثانية)."
-                )
+                if is_audio:
+                    warning_msg = (
+                        f"ملاحظة: تفاوت التوقيت في الملف الصوتي أدى إلى اختلاف مدة الجزء {i} "
+                        f"({format_duration(part.duration)}) عن المدة المطلوبة "
+                        f"بمقدار {dev:.1f} ثانية (أكبر من الحد {max_deviation_thresh:.1f} ثانية)."
+                    )
+                else:
+                    warning_msg = (
+                        f"ملاحظة: تباعد إطارات الـ Keyframes في الفيديو أدى إلى اختلاف مدة الجزء {i} "
+                        f"({format_duration(part.duration)}) عن المدة المطلوبة "
+                        f"بمقدار {dev:.1f} ثانية (أكبر من الحد {max_deviation_thresh:.1f} ثانية)."
+                    )
                 logger.info("تنبيه انحراف المدة: %s", warning_msg)
                 break
 
@@ -283,4 +327,5 @@ class VideoSplitter:
             has_deviation_warning=has_deviation_warning,
             warning_message=warning_msg,
             created_files=created_files,
+            is_audio_only=is_audio,
         )

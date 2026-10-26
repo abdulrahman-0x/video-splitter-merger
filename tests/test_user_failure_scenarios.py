@@ -90,7 +90,7 @@ class TestUserInputScenarios:
             "video.flv",
             "movie.wmv",
             "clip.webm",
-            "audio.mp3",
+            "audio.wma",
             "image.png",
             "doc.pdf",
             "archive.zip",
@@ -154,7 +154,7 @@ class TestFileAndPathProblems:
 
         splitter = VideoSplitter()
         # Request 60s split on a 10s video
-        with pytest.raises(ValueError, match="الفيديو أقصر من مدة التقسيم المحددة"):
+        with pytest.raises(ValueError, match="(الفيديو|الملف) أقصر من مدة التقسيم المحددة"):
             splitter.split(
                 input_path=short_video,
                 segment_duration_sec=60.0,

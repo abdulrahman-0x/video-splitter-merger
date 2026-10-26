@@ -232,7 +232,7 @@ class MergeView(ctk.CTkFrame):
         self.summary_textbox.configure(state="disabled")
 
     def _on_browse_folder(self) -> None:
-        chosen = filedialog.askdirectory(title="اختر مجلد أجزاء الفيديو")
+        chosen = filedialog.askdirectory(title="اختر مجلد أجزاء الفيديو أو الصوت")
         if chosen:
             self._handle_selected_target(Path(chosen).resolve())
 
@@ -273,14 +273,29 @@ class MergeView(ctk.CTkFrame):
             if ffprobe_bin:
                 probes, sum_durations = verify_parts_compatibility(parts, ffprobe_bin)
                 self.total_estimated_duration = sum_durations
-                base_v = probes[0]["video_streams"][0]
-                codec = base_v.get("codec_name", "N/A")
-                w = base_v.get("width", "N/A")
-                h = base_v.get("height", "N/A")
+                
+                if probes[0].get("is_audio_only") or not probes[0]["video_streams"]:
+                    audio_s = probes[0]["audio_streams"][0] if probes[0]["audio_streams"] else {}
+                    codec = audio_s.get("codec_name", "N/A").upper()
+                    rate = audio_s.get("sample_rate", "N/A")
+                    channels = audio_s.get("channels", "N/A")
+                    info_text = (
+                        f"تم العثور على {len(parts)} أجزاء صوتية متوافقة | "
+                        f"الترميز: {codec} ({rate} Hz, {channels}ch) | "
+                        f"المدة الكلية المتوقعة: {format_duration(sum_durations)}"
+                    )
+                else:
+                    base_v = probes[0]["video_streams"][0]
+                    codec = base_v.get("codec_name", "N/A")
+                    w = base_v.get("width", "N/A")
+                    h = base_v.get("height", "N/A")
+                    info_text = (
+                        f"تم العثور على {len(parts)} أجزاء متوافقة | "
+                        f"الترميز: {codec} ({w}x{h}) | المدة الكلية المتوقعة: {format_duration(sum_durations)}"
+                    )
 
                 self.target_info_label.configure(
-                    text=f"تم العثور على {len(parts)} أجزاء متوافقة | "
-                    f"الترميز: {codec} ({w}x{h}) | المدة الكلية المتوقعة: {format_duration(sum_durations)}",
+                    text=info_text,
                     text_color="gray",
                 )
             else:
@@ -349,7 +364,7 @@ class MergeView(ctk.CTkFrame):
 
         size_mb = result.output_path.stat().st_size / (1024 * 1024)
         lines = [
-            "تم دمج أجزاء الفيديو بنجاح فائق (Stream Copy بدون أي فقدان للجودة)!",
+            "تم دمج الأجزاء بنجاح فائق (Stream Copy بدون أي فقدان للجودة)!",
             f"الملف المدمج: {result.output_path}",
             f"الحجم الإجمالي: {size_mb:.1f} MB",
             f"المدة الكلية: {format_duration(result.total_duration)} ({result.total_duration:.2f} ثانية)",

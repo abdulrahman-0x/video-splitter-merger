@@ -231,15 +231,17 @@ class SplitView(ctk.CTkFrame):
 
     def _on_browse_file(self) -> None:
         filetypes = [
-            ("ملفات الفيديو المدعومة", "*.mp4;*.mkv;*.mov;*.avi"),
+            ("كافة وسائط الفيديو والصوت المدعومة", "*.mp4;*.mkv;*.mov;*.avi;*.wav;*.mp3;*.m4a;*.flac;*.aac;*.ogg;*.opus"),
+            ("ملفات الصوت (WAV, MP3, M4A, FLAC, AAC...)", "*.wav;*.mp3;*.m4a;*.flac;*.aac;*.ogg;*.opus"),
+            ("ملفات الفيديو (MP4, MKV, MOV, AVI)", "*.mp4;*.mkv;*.mov;*.avi"),
+            ("ملفات WAV", "*.wav"),
+            ("ملفات MP3", "*.mp3"),
             ("ملفات MP4", "*.mp4"),
             ("ملفات MKV", "*.mkv"),
-            ("ملفات MOV", "*.mov"),
-            ("ملفات AVI", "*.avi"),
             ("كافة الملفات", "*.*"),
         ]
         chosen = filedialog.askopenfilename(
-            title="اختر ملف الفيديو للتقسيم",
+            title="اختر ملف الفيديو أو الصوت للتقسيم",
             filetypes=filetypes,
         )
         if not chosen:
@@ -266,9 +268,24 @@ class SplitView(ctk.CTkFrame):
             self.media_duration = probe["duration"]
             size_mb = probe["size_bytes"] / (1024 * 1024)
             best_effort_note = " (دعم تجريبي)" if status == "best_effort" else ""
+            
+            if probe.get("is_audio_only"):
+                audio_s = probe["audio_streams"][0] if probe["audio_streams"] else {}
+                a_codec = audio_s.get("codec_name", "audio").upper()
+                a_rate = audio_s.get("sample_rate", "N/A")
+                a_channels = audio_s.get("channels", "N/A")
+                info_text = (
+                    f"المدة: {format_duration(self.media_duration)} | الحجم: {size_mb:.1f} MB | "
+                    f"صوت {a_codec} ({a_rate} Hz, {a_channels}ch){best_effort_note}"
+                )
+            else:
+                info_text = (
+                    f"المدة: {format_duration(self.media_duration)} | "
+                    f"الحجم: {size_mb:.1f} MB | الصيغة: {chosen_path.suffix.upper()}{best_effort_note}"
+                )
+
             self.file_info_label.configure(
-                text=f"المدة: {format_duration(self.media_duration)} | "
-                f"الحجم: {size_mb:.1f} MB | الصيغة: {chosen_path.suffix.upper()}{best_effort_note}",
+                text=info_text,
                 text_color="gray" if status != "best_effort" else "#FFA000",
             )
         except Exception as exc:
@@ -347,10 +364,11 @@ class SplitView(ctk.CTkFrame):
         self.open_folder_btn.configure(state="normal")
         self.progress_bar.set(1.0)
         self.percent_label.configure(text="100%")
-        self.set_status("اكتمل تقسيم الفيديو بنجاح!", is_success=True)
+        media_name = "الملف الصوتي" if result.is_audio_only else "الفيديو"
+        self.set_status(f"اكتمل تقسيم {media_name} بنجاح!", is_success=True)
 
         lines = [
-            f"تم تقسيم الفيديو بنجاح إلى {len(result.parts)} جزء/أجزاء.",
+            f"تم تقسيم {media_name} بنجاح إلى {len(result.parts)} جزء/أجزاء.",
             f"مجلد الحفظ: {result.parts_dir}",
             f"ملف قائمة الدمج التلقائية: {result.parts_list_file.name}",
             "",
@@ -363,7 +381,7 @@ class SplitView(ctk.CTkFrame):
             lines.append("")
             lines.append("=" * 60)
             lines.append(f"تنبيه: {result.warning_message}")
-            lines.append("السبب: التقسيم بدون إعادة ترميز (Stream Copy) يعتمد على نقاط Keyframes الأصلية.")
+            lines.append("السبب: التقسيم بدون إعادة ترميز (Stream Copy) يعتمد على التوقيتات وحزم الإطارات الأصلية.")
             lines.append("=" * 60)
 
         self.summary_textbox.configure(state="normal")

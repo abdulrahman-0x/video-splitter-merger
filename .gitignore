@@ -27,16 +27,18 @@ htmlcov/
 test_output/
 tmp/
 tests/video test/
+tests/audio test/
 tests/**/*.mp4
+tests/**/*.wav
+tests/**/*.mp3
+tests/**/*.flac
+tests/**/*.m4a
 
 # Temporary media output from tests or processing
 *.partial.*
 *_parts/
 *_parts_*/
-*_merged.mp4
-*_merged.mkv
-*_merged.mov
-*_merged.avi
+*_merged.*
 
 # IDE
 .vscode/

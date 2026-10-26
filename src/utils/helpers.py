@@ -8,8 +8,16 @@ from pathlib import Path
 from typing import Any, Tuple
 
 # Supported video container extensions
-SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".mov"}
-BEST_EFFORT_EXTENSIONS = {".avi"}
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov"}
+BEST_EFFORT_VIDEO_EXTENSIONS = {".avi"}
+
+# Supported audio container extensions
+SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac"}
+BEST_EFFORT_AUDIO_EXTENSIONS = {".aac", ".ogg", ".opus"}
+
+# Aggregated supported & best effort extensions
+SUPPORTED_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_AUDIO_EXTENSIONS
+BEST_EFFORT_EXTENSIONS = BEST_EFFORT_VIDEO_EXTENSIONS | BEST_EFFORT_AUDIO_EXTENSIONS
 ALL_ALLOWED_EXTENSIONS = SUPPORTED_EXTENSIONS | BEST_EFFORT_EXTENSIONS
 
 # Unicode digit translation maps
@@ -156,11 +164,11 @@ def escape_concat_path(path: str | Path) -> str:
 
 
 def check_supported_format(path: str | Path) -> Tuple[bool, str]:
-    """Check if the file format is supported.
+    """Check if the file format is supported (video or audio).
 
     Returns:
-    - (True, "supported"): MP4, MKV, MOV
-    - (True, "best_effort"): AVI
+    - (True, "supported"): MP4, MKV, MOV, WAV, MP3, M4A, FLAC
+    - (True, "best_effort"): AVI, AAC, OGG, OPUS
     - (False, "unsupported"): Any other format
     """
     suffix = Path(path).suffix.lower()
@@ -169,6 +177,27 @@ def check_supported_format(path: str | Path) -> Tuple[bool, str]:
     if suffix in BEST_EFFORT_EXTENSIONS:
         return True, "best_effort"
     return False, "unsupported"
+
+
+def is_audio_file(path: str | Path) -> bool:
+    """Check if the file extension corresponds to a supported audio format."""
+    suffix = Path(path).suffix.lower()
+    return suffix in (SUPPORTED_AUDIO_EXTENSIONS | BEST_EFFORT_AUDIO_EXTENSIONS)
+
+
+def is_video_file(path: str | Path) -> bool:
+    """Check if the file extension corresponds to a supported video format."""
+    suffix = Path(path).suffix.lower()
+    return suffix in (SUPPORTED_VIDEO_EXTENSIONS | BEST_EFFORT_VIDEO_EXTENSIONS)
+
+
+def get_media_category(path: str | Path) -> str:
+    """Return category of media: 'video', 'audio', or 'unknown'."""
+    if is_video_file(path):
+        return "video"
+    if is_audio_file(path):
+        return "audio"
+    return "unknown"
 
 
 def is_path_length_safe(path: str | Path, max_length: int = 250) -> bool:

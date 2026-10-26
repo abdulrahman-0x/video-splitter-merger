@@ -121,8 +121,17 @@ def probe_media(file_path: Path | str, ffprobe_path: Optional[Path] = None) -> D
     data_streams = [s for s in streams if s.get("codec_type") == "data"]
     attachment_streams = [s for s in streams if s.get("codec_type") == "attachment"]
 
-    if not video_streams:
-        raise ValueError("الملف المحدد لا يحتوي على أي مسار فيديو صالح.")
+    # Differentiate between actual video stream and embedded album cover art
+    real_video_streams = [
+        s for s in video_streams if not s.get("disposition", {}).get("attached_pic")
+    ]
+    album_art_streams = [
+        s for s in video_streams if s.get("disposition", {}).get("attached_pic")
+    ]
+    is_audio_only = len(real_video_streams) == 0 and len(audio_streams) > 0
+
+    if not video_streams and not audio_streams:
+        raise ValueError("الملف المحدد لا يحتوي على أي مسار فيديو أو صوت صالح.")
 
     # Determine duration
     duration = None
@@ -144,6 +153,39 @@ def probe_media(file_path: Path | str, ffprobe_path: Optional[Path] = None) -> D
     if duration is None:
         duration = 0.0
 
+    # Special handling for raw FLAC streams:
+    # In FLAC stream copy segmentation, STREAMINFO contains total_samples of the parent file,
+    # causing ffprobe format/stream duration to report the undivided file's duration.
+    # We inspect packet pts timestamps to compute the actual segment duration.
+    if is_audio_only and any(s.get("codec_name") == "flac" for s in audio_streams):
+        try:
+            pkt_cmd = [
+                str(ffprobe_path),
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "packet=pts_time,duration_time",
+                "-of", "csv=p=0",
+                str(target_path),
+            ]
+            pkt_proc = subprocess.run(
+                pkt_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            if pkt_proc.returncode == 0 and pkt_proc.stdout:
+                lines = pkt_proc.stdout.decode("utf-8", errors="ignore").strip().splitlines()
+                if lines:
+                    first_pts = float(lines[0].split(",")[0])
+                    last_parts = lines[-1].split(",")
+                    last_pts = float(last_parts[0])
+                    last_dur = float(last_parts[1]) if len(last_parts) > 1 and last_parts[1] else 0.0
+                    actual_dur = (last_pts + last_dur) - first_pts
+                    if actual_dur > 0:
+                        duration = actual_dur
+        except Exception as exc:
+            logger.debug("تعذر فحص حزم ملف FLAC لتحديد المدة: %s", exc)
+
     size_bytes = 0
     if "size" in format_info:
         try:
@@ -158,6 +200,9 @@ def probe_media(file_path: Path | str, ffprobe_path: Optional[Path] = None) -> D
         "format_name": format_info.get("format_name", ""),
         "duration": duration,
         "size_bytes": size_bytes,
+        "is_audio_only": is_audio_only,
+        "real_video_streams": real_video_streams,
+        "album_art_streams": album_art_streams,
         "video_streams": video_streams,
         "audio_streams": audio_streams,
         "subtitle_streams": subtitle_streams,

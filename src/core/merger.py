@@ -143,10 +143,49 @@ def verify_parts_compatibility(
     base_videos = base_probe["video_streams"]
     base_audios = base_probe["audio_streams"]
     base_subtitles = base_probe["subtitle_streams"]
+    is_audio_only = base_probe.get("is_audio_only", False) or (not base_videos and bool(base_audios))
 
-    if not base_videos:
-        raise ValueError(f"الجزء الأول ({base_file}) لا يحتوي على أي مسار فيديو صالح.")
+    if not base_videos and not base_audios:
+        raise ValueError(f"الجزء الأول ({base_file}) لا يحتوي على أي مسار وسائط صالح.")
 
+    if is_audio_only:
+        if not base_audios:
+            raise ValueError(f"الجزء الأول ({base_file}) لا يحتوي على أي مسار صوتي صالح.")
+        b_a = base_audios[0]
+        b_a_codec = b_a.get("codec_name")
+        b_a_rate = b_a.get("sample_rate")
+        b_a_channels = b_a.get("channels")
+
+        for idx, (path, p_info) in enumerate(zip(part_paths[1:], probes[1:]), start=2):
+            cur_file = path.name
+            cur_audios = p_info["audio_streams"]
+            if not cur_audios:
+                raise ValueError(f"الجزء {idx} ({cur_file}) لا يحتوي على أي مسار صوتي.")
+            if len(cur_audios) != len(base_audios):
+                raise ValueError(
+                    f"عدم تطابق في مسارات الصوت: الجزء الأول ({base_file}) به {len(base_audios)} مسار، "
+                    f"بينما الجزء {idx} ({cur_file}) به {len(cur_audios)} مسار."
+                )
+            c_a = cur_audios[0]
+            if c_a.get("codec_name") != b_a_codec:
+                raise ValueError(
+                    f"اختلاف ترميز الصوت: الجزء الأول ({b_a_codec}) "
+                    f"يختلف عن الجزء {idx} ({c_a.get('codec_name')})."
+                )
+            if c_a.get("sample_rate") != b_a_rate:
+                raise ValueError(
+                    f"اختلاف معدل العينات الصوتي (Sample Rate): الجزء الأول ({b_a_rate} Hz) "
+                    f"يختلف عن الجزء {idx} ({c_a.get('sample_rate')} Hz)."
+                )
+            if c_a.get("channels") != b_a_channels:
+                raise ValueError(
+                    f"اختلاف قنوات الصوت: الجزء الأول ({b_a_channels} قنوات) "
+                    f"يختلف عن الجزء {idx} ({c_a.get('channels')} قنوات)."
+                )
+
+        return probes, total_parts_duration
+
+    # Video mode
     base_v = base_videos[0]
     b_v_codec = base_v.get("codec_name")
     b_v_width = base_v.get("width")
