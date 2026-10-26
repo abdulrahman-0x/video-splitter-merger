@@ -151,13 +151,18 @@ def verify_parts_compatibility(
     if is_audio_only:
         if not base_audios:
             raise ValueError(f"الجزء الأول ({base_file}) لا يحتوي على أي مسار صوتي صالح.")
-        b_a = base_audios[0]
-        b_a_codec = b_a.get("codec_name")
-        b_a_rate = b_a.get("sample_rate")
-        b_a_channels = b_a.get("channels")
 
         for idx, (path, p_info) in enumerate(zip(part_paths[1:], probes[1:]), start=2):
             cur_file = path.name
+            cur_real_videos = p_info.get("real_video_streams", [
+                s for s in p_info.get("video_streams", []) if not s.get("disposition", {}).get("attached_pic")
+            ])
+            if cur_real_videos:
+                raise ValueError(
+                    f"عدم تطابق في نوع الوسائط: الجزء الأول ({base_file}) ملف صوتي، "
+                    f"بينما الجزء {idx} ({cur_file}) يحتوي على مسار فيديو."
+                )
+
             cur_audios = p_info["audio_streams"]
             if not cur_audios:
                 raise ValueError(f"الجزء {idx} ({cur_file}) لا يحتوي على أي مسار صوتي.")
@@ -166,22 +171,32 @@ def verify_parts_compatibility(
                     f"عدم تطابق في مسارات الصوت: الجزء الأول ({base_file}) به {len(base_audios)} مسار، "
                     f"بينما الجزء {idx} ({cur_file}) به {len(cur_audios)} مسار."
                 )
-            c_a = cur_audios[0]
-            if c_a.get("codec_name") != b_a_codec:
-                raise ValueError(
-                    f"اختلاف ترميز الصوت: الجزء الأول ({b_a_codec}) "
-                    f"يختلف عن الجزء {idx} ({c_a.get('codec_name')})."
-                )
-            if c_a.get("sample_rate") != b_a_rate:
-                raise ValueError(
-                    f"اختلاف معدل العينات الصوتي (Sample Rate): الجزء الأول ({b_a_rate} Hz) "
-                    f"يختلف عن الجزء {idx} ({c_a.get('sample_rate')} Hz)."
-                )
-            if c_a.get("channels") != b_a_channels:
-                raise ValueError(
-                    f"اختلاف قنوات الصوت: الجزء الأول ({b_a_channels} قنوات) "
-                    f"يختلف عن الجزء {idx} ({c_a.get('channels')} قنوات)."
-                )
+
+            for s_idx, (b_stream, c_stream) in enumerate(zip(base_audios, cur_audios), start=1):
+                b_codec = b_stream.get("codec_name")
+                c_codec = c_stream.get("codec_name")
+                if b_codec != c_codec:
+                    stream_suffix = f" للمسار {s_idx}" if len(base_audios) > 1 else ""
+                    raise ValueError(
+                        f"اختلاف ترميز الصوت{stream_suffix}: الجزء الأول ({b_codec}) "
+                        f"يختلف عن الجزء {idx} ({c_codec})."
+                    )
+                b_rate = b_stream.get("sample_rate")
+                c_rate = c_stream.get("sample_rate")
+                if b_rate != c_rate:
+                    stream_suffix = f" للمسار {s_idx}" if len(base_audios) > 1 else ""
+                    raise ValueError(
+                        f"اختلاف معدل العينات الصوتي (Sample Rate){stream_suffix}: الجزء الأول ({b_rate} Hz) "
+                        f"يختلف عن الجزء {idx} ({c_rate} Hz)."
+                    )
+                b_ch = b_stream.get("channels")
+                c_ch = c_stream.get("channels")
+                if b_ch != c_ch:
+                    stream_suffix = f" للمسار {s_idx}" if len(base_audios) > 1 else ""
+                    raise ValueError(
+                        f"اختلاف قنوات الصوت{stream_suffix}: الجزء الأول ({b_ch} قنوات) "
+                        f"يختلف عن الجزء {idx} ({c_ch} قنوات)."
+                    )
 
         return probes, total_parts_duration
 
