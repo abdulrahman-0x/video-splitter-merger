@@ -33,7 +33,7 @@ tests/**/*.wav
 tests/**/*.mp3
 tests/**/*.flac
 tests/**/*.m4a
-
+*.wav
 # Temporary media output from tests or processing
 *.partial.*
 *_parts/
