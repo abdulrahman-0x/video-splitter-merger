@@ -502,43 +502,56 @@ class TestTailWithRealTool:
     def test_ten_parts_have_no_silent_join(
         self, fx_dir: Path, df_exe: Path, ffmpeg_tools: Tuple[Path, Path]
     ) -> None:
-        """Ten 3 s parts denoised separately: no all-zero tail at any join."""
+        """Ten 3 s parts denoised separately: no all-zero tail and no join click.
+
+        The parts are slices of ONE continuous signal, so the source's own step at
+        each boundary is the natural reference: the denoised splice must not add a
+        discontinuity beyond 3x the louder of (neighbour p99, source join step).
+        """
         np = pytest.importorskip("numpy")
         from src.core.denoise import denoise_wav
 
         ffmpeg, ffprobe = ffmpeg_tools
         d = _sub(fx_dir, "wp1_join")
         part_s = 3.0
+        n = int(part_s * 48000)
+        total = n * 10
+        # continuous speech-like material: tone + noise + slow amplitude drift
+        rng = np.random.default_rng(21)
+        t = np.arange(total) / 48000.0
+        sig = (0.25 * np.sin(2 * np.pi * 320 * t)
+               + 0.06 * rng.standard_normal(total)
+               + 0.05 * np.sin(2 * np.pi * 0.7 * t))
+        sig = np.clip(sig, -1, 1)
+
+        def write_slice(arr: "object", path: Path) -> None:
+            pcm = (np.clip(arr, -1, 1) * 32767).astype("<i2")
+            with wave.open(str(path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(48000)
+                wf.writeframes(pcm.tobytes())
+
         parts: List[Path] = []
         for i in range(10):
             p = d / f"p{i:02d}.wav"
-            subprocess.run([
-                str(ffmpeg), "-nostdin", "-y", "-f", "lavfi",
-                "-i", f"sine=frequency={300 + 20 * i}:duration={part_s}:sample_rate=48000",
-                "-f", "lavfi", "-i",
-                f"anoisesrc=color=pink:amplitude=0.05:duration={part_s}"
-                f":sample_rate=48000:seed={i + 1}",
-                "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:normalize=0[a]",
-                "-map", "[a]", "-c:a", "pcm_s16le", str(p),
-            ], check=True, capture_output=True)
+            write_slice(sig[i * n:(i + 1) * n], p)
             out = d / f"p{i:02d}_out.wav"
             denoise_wav(p, out, strength_db=12, exe=df_exe, ffmpeg=ffmpeg,
                         ffprobe=ffprobe, temp_base=fx_dir)
             parts.append(out)
 
-        n = int(part_s * 48000)
-        worst_step = 0.0
-        worst_p99 = 1e-9
         for p in parts:
             x = _read_wav(p)[:, 0]
             assert len(x) == n
             assert _trailing_zeros(x, 4800) <= 2, p.name
-            last200 = x[-9600:]
-            worst_step = max(worst_step, float(np.abs(np.diff(last200)).max()))
-            worst_p99 = max(worst_p99, float(np.percentile(np.abs(np.diff(x[:-9600])), 99)))
-        assert worst_step <= 3.0 * worst_p99, (worst_step, worst_p99)
 
-        # and the concatenation has no zero run at any boundary
         cat = np.concatenate([_read_wav(p)[:, 0] for p in parts])
         for k in range(1, 10):
             assert _trailing_zeros(cat[: k * n], 1440) <= 2, f"join {k}"
+            j = k * n
+            jump = abs(float(cat[j]) - float(cat[j - 1]))
+            src_jump = abs(float(sig[j]) - float(sig[j - 1]))
+            seg = np.abs(np.diff(cat[max(0, j - 48000):j + 48000]))
+            reference = max(float(np.percentile(seg, 99)), src_jump)
+            assert jump <= 3.0 * reference, (k, jump, reference, src_jump)

@@ -1079,14 +1079,26 @@ def _remux_part_with_denoised_audio(
         cmd += ["-i", str(wav)]
 
     # Walk the original streams in order and substitute audio payloads.
+    # Stream metadata (language, title, ...) does NOT follow a stream that is
+    # re-encoded from a different input, so it is copied explicitly per stream.
     audio_seen = 0
     out_audio_idx = 0
+    meta_args: List[str] = []
     for stream in info.get("all_streams", []):
         stype = (stream.get("codec_type") or "").lower()
         idx = stream.get("index")
         if stype == "audio":
             if audio_seen < len(denoised):
                 cmd += ["-map", f"{audio_seen + 1}:a:0"]
+                tags = stream.get("tags") or {}
+                for key, value in tags.items():
+                    if str(key).lower() in ("encoder", "duration", "duration-ms"):
+                        continue
+                    meta_args += [f"-metadata:s:a:{out_audio_idx}", f"{key}={value}"]
+                disp = stream.get("disposition") or {}
+                for key, value in disp.items():
+                    if value:
+                        meta_args += [f"-disposition:a:{out_audio_idx}", key]
                 out_audio_idx += 1
             else:
                 cmd += ["-map", f"0:{idx}"]
@@ -1100,7 +1112,7 @@ def _remux_part_with_denoised_audio(
 
     # Copy everything that is not being re-encoded, and the container metadata
     # (chapters and global tags follow automatically unless -map_chapters is used).
-    cmd += ["-c", "copy", "-map_chapters", "0", "-map_metadata", "0",
+    cmd += ["-c", "copy", "-map_chapters", "0", "-map_metadata", "0", *meta_args,
             "-f", format_for_suffix(part.suffix)]
     for idx, (encoder, bitrate) in enumerate(denoise_encoders[: len(denoised)]):
         cmd += [f"-c:a:{idx}", encoder]
