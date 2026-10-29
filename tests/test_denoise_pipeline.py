@@ -6,7 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 import pytest
 
@@ -216,3 +216,79 @@ class TestStreamPreservation:
         assert (ba.get("tags") or {}).get("language") == (aa.get("tags") or {}).get("language")
         assert (ba.get("tags") or {}).get("title") == (aa.get("tags") or {}).get("title")
         assert len(before.get("chapters") or []) == len(after.get("chapters") or [])
+
+
+class TestTempDirPlacement:
+    """WP4: the temp dir lives inside the parts folder while the run is active."""
+
+    @pytest.mark.deepfilter_exe
+    def test_temp_dir_inside_parts_folder_during_run(
+        self, fx_dir: Path, tools: Tuple[Path, Path], df_exe: Path
+    ) -> None:
+        import threading
+        import time
+
+        ffmpeg, ffprobe = tools
+        d = (fx_dir / "wp4").resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        part = d / "probe.wav"
+        subprocess.run([str(ffmpeg), "-nostdin", "-y", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=15:sample_rate=48000",
+                        "-c:a", "pcm_s24le", str(part)], check=True, capture_output=True)
+
+        seen: List[List[str]] = []
+        stop = {"v": False}
+
+        def watch() -> None:
+            while not stop["v"]:
+                found = [p.name for p in d.glob(".dfn_tmp_*")]
+                if found and found not in seen:
+                    seen.append(found)
+                time.sleep(0.05)
+
+        t = threading.Thread(target=watch, daemon=True)
+        t.start()
+        rep = denoise_parts([(part, 15.0)],
+                            settings={"enabled": True, "strength_db": 12, "auto_convert": True,
+                                      "restore_original_rate": True,
+                                      "denoise_dual_mono_shortcut": True, "workers": 1,
+                                      "parts_dir": str(d)},
+                            ffmpeg_exe=ffmpeg, ffprobe_exe=ffprobe, deep_filter_exe=df_exe)
+        stop["v"] = True
+        t.join(timeout=2)
+        assert rep.statuses[0].ok, rep.statuses[0].reason
+        assert seen, "the temp dir was never created inside the parts folder"
+        assert all(name.startswith(".dfn_tmp_") for name in seen[0])
+        assert list(d.glob(".dfn_tmp_*")) == [], "the temp dir was not cleaned up"
+
+
+class TestReportFileDoesNotBreakMerge:
+    """WP6: denoise_report.txt must be ignored by the merger."""
+
+    @pytest.mark.deepfilter_exe
+    def test_merge_succeeds_with_report_file_present(
+        self, fx_dir: Path, tools: Tuple[Path, Path], df_exe: Path
+    ) -> None:
+        from src.core.merger import VideoMerger
+        from src.core.splitter import VideoSplitter
+
+        ffmpeg, ffprobe = tools
+        d = (fx_dir / "wp6merge").resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        src = d / "long.wav"
+        subprocess.run([str(ffmpeg), "-nostdin", "-y", "-f", "lavfi",
+                        "-i", "sine=frequency=440:duration=40:sample_rate=48000",
+                        "-c:a", "pcm_s16le", str(src)], check=True, capture_output=True)
+        res = VideoSplitter().split(src, 20.0, output_parent_dir=d)
+        parts = [(p.file_path, p.duration) for p in res.parts]
+        rep = denoise_parts(parts,
+                            settings={"enabled": True, "strength_db": 12, "auto_convert": True,
+                                      "restore_original_rate": True,
+                                      "denoise_dual_mono_shortcut": True, "workers": 1,
+                                      "parts_dir": str(res.parts_dir)},
+                            ffmpeg_exe=ffmpeg, ffprobe_exe=ffprobe, deep_filter_exe=df_exe)
+        assert rep.report_path is not None and rep.report_path.is_file()
+        merged = VideoMerger().merge(input_target=res.parts_list_file, output_parent_dir=d)
+        assert Path(merged.output_path).is_file()
+        assert rep.report_path.is_file()  # the merge did not delete it
+
