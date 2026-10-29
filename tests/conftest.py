@@ -195,3 +195,14 @@ def create_synthetic_audio(
         )
 
     return output_path
+
+# ---------------------------------------------------------------------------
+# Markers
+# ---------------------------------------------------------------------------
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register project markers (avoids PytestUnknownMarkWarning)."""
+    config.addinivalue_line(
+        "markers",
+        "deepfilter_exe: test needs a real deep-filter.exe on PATH or the default location",
+    )

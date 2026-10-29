@@ -30,7 +30,10 @@ import pytest
 
 from src.core.denoise import (
     DF_DELAY_SAMPLES,
+    DF_EXIT_OOM,
+    PAD_RMS_DBFS,
     PAD_SAMPLES_48K,
+    RAM_INTERCEPT_MB,
     DenoiseError,
     DenoisePartStatus,
     DenoiseReport,
@@ -39,14 +42,19 @@ from src.core.denoise import (
     _CancelState,
     _map_df_failure,
     build_df_args,
+    build_padded_input_filter,
+    choose_temp_base,
     compute_n48,
     denoise_parts,
     denoise_wav,
     estimate_ram_mb,
     find_deep_filter,
     get_version,
+    guard_admits,
     is_conformant_wav,
+    pcm16_rms_from_wav,
     ram_guard_limit_mb,
+    tail_is_damaged,
     wav_file_sample_count,
 )
 from src.core.ffmpeg_manager import probe_media
@@ -245,19 +253,46 @@ class TestPureHelpers:
             assert is_conformant_wav(variant) is False, variant
 
     def test_estimate_ram_mb(self) -> None:
-        assert estimate_ram_mb(3600, 1) == int(3600 * 0.45)
-        assert estimate_ram_mb(3600, 2) == int(3600 * 2 * 0.45)
-        assert estimate_ram_mb(0, 0) == 0
-        assert estimate_ram_mb(1235.5, 2) < 4096  # real lecture: ~1.1 GB stereo
+        # Fitted to the measured table (deep-filter-test/run_20261030_0004).
+        measured = {
+            (120.0, 1): 96.1, (600.0, 1): 259.7, (1800.0, 1): 699.3,
+            (120.0, 2): 174.5, (600.0, 2): 701.7, (1200.1, 2): 1360.7,
+            (1800.0, 2): 2020.2,
+        }
+        for (dur, ch), actual in measured.items():
+            est = estimate_ram_mb(dur, ch)
+            assert abs(est - actual) / actual <= 0.05, (dur, ch, est, actual)
+        assert estimate_ram_mb(0, 0) == estimate_ram_mb(0, 1)  # intercept only
+        assert estimate_ram_mb(0, 1) == 49
+        # one extra channel costs ~3x, not 2x
+        assert estimate_ram_mb(600, 2) / estimate_ram_mb(600, 1) > 2.5
 
-    def test_ram_guard_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("src.core.denoise.get_available_ram_mb", lambda: None)
-        assert ram_guard_limit_mb() == 4096
-        monkeypatch.setattr("src.core.denoise.get_available_ram_mb", lambda: 8000)
-        assert ram_guard_limit_mb() == 2000
-        monkeypatch.setattr("src.core.denoise.get_available_ram_mb", lambda: 200)
-        assert ram_guard_limit_mb() == 50
-        assert 0 < ram_guard_limit_mb() <= 4096  # real machine sanity
+    def test_ram_guard_limit(self) -> None:
+        assert ram_guard_limit_mb(8000) == 4096
+        assert ram_guard_limit_mb(2700) == 1932
+        assert ram_guard_limit_mb(1200) == 432
+        assert ram_guard_limit_mb(500) == 0
+        assert ram_guard_limit_mb(768) == 0
+        assert 0 <= ram_guard_limit_mb() <= 4096  # real machine sanity
+
+    def test_guard_admits(self) -> None:
+        # At 2700 MB available the limit is 1932 MB.
+        assert guard_admits(600, 1, 2700)[0] is True       # 10 min mono: 300 MB
+        assert guard_admits(600, 2, 2700)[0] is True       # 10 min stereo: 804 MB
+        assert guard_admits(1800, 1, 2700)[0] is True      # 30 min mono: 797 MB
+        assert guard_admits(1800, 2, 2700)[0] is False     # 30 min stereo: 2310 MB
+        assert guard_admits(1200, 2, 2700)[0] is True      # 20 min stereo: 1557 MB
+        ok, est, limit = guard_admits(1800, 2, 2700)
+        assert est > limit
+
+    def test_map_df_oom_and_toowide(self) -> None:
+        oom = str(_map_df_failure(DF_EXIT_OOM, ""))
+        assert "الذاكرة" in oom and "أقصر" in oom
+        assert "3221226505" not in oom  # the raw code belongs in the log, not the dialog
+        assert "الذاكرة" in str(_map_df_failure(1, "memory allocation of 474462720 bytes failed"))
+        wide = str(_map_df_failure(101, "TooWide"))
+        assert "24" in wide and "16" in wide
+        assert "الحديد" not in wide  # the old nonsense sentence is gone
 
     def test_compute_n48(self) -> None:
         assert compute_n48(1.0) == 48000
@@ -301,8 +336,9 @@ class TestPureHelpers:
             _wcount(p)
 
     def test_map_df_failure_codes(self) -> None:
-        assert "رمز 101" in str(_map_df_failure(101, ""))
-        assert "TooWide" in str(_map_df_failure(3, "libDF\\src\\wav_utils.rs:87:39 TooWide"))
+        assert "24" in str(_map_df_failure(101, ""))
+        assert "TooWide" not in str(_map_df_failure(101, ""))  # raw text stays in the log
+        assert "24" in str(_map_df_failure(3, "libDF\\src\\wav_utils.rs:87:39 TooWide"))
         assert "رمز 1" in str(_map_df_failure(1, "Caused by: لا ملف."))
         assert "رمز 2" in str(_map_df_failure(2, "الوسائط غير صالحة"))
         assert "أُلغيت" in str(_map_df_failure(-1073741510, ""))
@@ -344,15 +380,28 @@ class TestPureHelpers:
         assert len(report.failures) == 1
 
     def test_avg_rtf(self) -> None:
-        assert _avg_rtf(None) == 0.20
+        assert _avg_rtf(None) == 0.22          # measured mono / dual-mono RTF
         assert _avg_rtf({"rtf_history": {1: [0.2, 0.3], 2: [0.5]}}) == pytest.approx(1 / 3)
         assert _avg_rtf({"rtf_history": {}, "rtf_default": 0.33}) == 0.33
-        assert _avg_rtf({}) == 0.20
+        assert _avg_rtf({}) == 0.22
 
     def test_df_delay_padding_constants(self) -> None:
-        # Measured at 48 kHz for deep-filter 0.5.6 (plan section 2).
+        # Measured at 48 kHz for deep-filter 0.5.6.
         assert DF_DELAY_SAMPLES == 1440
         assert PAD_SAMPLES_48K == 4800
+        # The pad must be audible to the tool's gate, not digital silence.
+        assert PAD_RMS_DBFS == -55.0
+
+    def test_pad_filter_is_not_silence(self) -> None:
+        fc = build_padded_input_filter()
+        assert "aevalsrc" in fc and "random(0)" in fc
+        assert "apad" not in fc          # the old silent pad is gone
+        assert "concat=n=2" in fc
+        mono = build_padded_input_filter(downmix_mono=True)
+        assert "pan=mono|c0=0.5*c0+0.5*c1" in mono
+        assert "channel_layouts=mono" in mono
+        stereo = build_padded_input_filter(src_channels=2)
+        assert "channel_layouts=stereo" in stereo
 
     def test_format_for_suffix(self) -> None:
         from src.core.denoise import format_for_suffix
@@ -865,7 +914,7 @@ class TestDenoiseParts:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         ffmpeg, ffprobe = require_ffmpeg
-        monkeypatch.setattr("src.core.denoise.ram_guard_limit_mb", lambda: 0)
+        monkeypatch.setattr("src.core.denoise.ram_guard_limit_mb", lambda *a, **k: 0)
         d = _sub(fx_dir, "ptra")
         part = _gen_sine_wav(ffmpeg, d / "part.wav", duration=3.0, rate=48000, channels=1)
         sha_before = _sha256(part)

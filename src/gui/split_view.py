@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -19,6 +20,8 @@ from src.utils.helpers import (
     normalize_numeric_string,
     parse_duration_minutes,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SplitView(ctk.CTkFrame):
@@ -172,13 +175,22 @@ class SplitView(ctk.CTkFrame):
 
         self.denoise_strength_entry = ctk.CTkEntry(
             strength_row,
-            placeholder_text="100",
+            placeholder_text="12",
             width=70,
             height=30,
         )
-        self.denoise_strength_entry.insert(0, "100")
+        self.denoise_strength_entry.insert(0, "12")
         self.denoise_strength_entry.pack(side="left", padx=(6, 10))
 
+        # Presets carry numeric labels only; the measured numbers live in the
+        # tooltip/status text (WP8). Noise-floor change / loudness change.
+        self.preset_hints = {
+            "6": "6 dB: أرضية الضوضاء -6.1 dB، الجهارة -4.0 LU",
+            "12": "12 dB: أرضية الضوضاء -12.0 dB، الجهارة -4.1 LU",
+            "20": "20 dB: أرضية الضوضاء -20.0 dB، الجهارة -5.5 LU",
+            "30": "30 dB: أرضية الضوضاء -29.7 dB، الجهارة -6.3 LU",
+            "100": "100 dB: أرضية الضوضاء -54.8 dB، الجهارة -6.5 LU",
+        }
         for preset in (6, 12, 20, 30, 100):
             preset_btn = ctk.CTkButton(
                 strength_row,
@@ -188,10 +200,11 @@ class SplitView(ctk.CTkFrame):
                 command=lambda value=str(preset): self._on_strength_preset(value),
             )
             preset_btn.pack(side="left", padx=(0, 6))
+            self._attach_tooltip(preset_btn, self.preset_hints[str(preset)])
 
         ctk.CTkLabel(
             options_frame,
-            text="الأقل يحتفظ بمزيد من الأصوات والضوضاء الأصلية، والأعلى يزيل مزيداً من الضوضاء. القيم فوق 70 تكاد تشبه 100. جرّب عينة قصيرة أولاً.",
+            text="القيم فوق 70 تكاد تشبه 100. جرّب عينة قصيرة أولاً.",
             font=ctk.CTkFont(size=11),
             text_color="gray",
             anchor="w",
@@ -219,31 +232,15 @@ class SplitView(ctk.CTkFrame):
         )
         self.denoise_restore_rate_cb.pack(side="left", padx=(16, 0))
 
-        workers_row = ctk.CTkFrame(options_frame, fg_color="transparent")
-        workers_row.grid(row=8, column=0, columnspan=2, sticky="w", padx=15, pady=(0, 4))
-
-        ctk.CTkLabel(
-            workers_row,
-            text="معالجة متوازية (متقدم):",
+        # WP3: dual-mono shortcut (default on).
+        self.denoise_dual_mono_var = ctk.BooleanVar(value=True)
+        self.denoise_dual_mono_cb = ctk.CTkCheckBox(
+            options_frame,
+            text="اكتشاف القناتين المتطابقتين ومعالجتهما كقناة واحدة (أسرع وأقل ذاكرة)",
+            variable=self.denoise_dual_mono_var,
             font=ctk.CTkFont(size=12),
-            anchor="w",
-        ).pack(side="left")
-
-        self.denoise_workers_var = ctk.IntVar(value=1)
-        ctk.CTkRadioButton(
-            workers_row,
-            text="1",
-            value=1,
-            variable=self.denoise_workers_var,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left", padx=(6, 2))
-        ctk.CTkRadioButton(
-            workers_row,
-            text="2 (ضعف استهلاك الذاكرة)",
-            value=2,
-            variable=self.denoise_workers_var,
-            font=ctk.CTkFont(size=12),
-        ).pack(side="left")
+        )
+        self.denoise_dual_mono_cb.grid(row=8, column=0, columnspan=2, sticky="w", padx=15, pady=(2, 6))
 
         df_status_row = ctk.CTkFrame(options_frame, fg_color="transparent")
         df_status_row.grid(row=9, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 10))
@@ -487,10 +484,59 @@ class SplitView(ctk.CTkFrame):
         self.denoise_strength_entry.delete(0, "end")
         self.denoise_strength_entry.insert(0, value)
 
+    def _attach_tooltip(self, widget: ctk.CTkBaseClass, text: str) -> None:
+        """Minimal hover tooltip (no extra dependency)."""
+        tip: dict = {"win": None}
+
+        def show(_event=None) -> None:
+            if tip["win"] is not None:
+                return
+            win = ctk.CTkToplevel(widget)
+            win.wm_overrideredirect(True)
+            win.attributes("-topmost", True)
+            label = ctk.CTkLabel(
+                win, text=text, font=ctk.CTkFont(size=11),
+                fg_color="#2b2b2b", text_color="#f0f0f0", corner_radius=4,
+            )
+            label.pack(padx=6, pady=4)
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() - 34
+            win.geometry(f"+{x}+{y}")
+            tip["win"] = win
+
+        def hide(_event=None) -> None:
+            win = tip.get("win")
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                tip["win"] = None
+
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
+        widget.bind("<ButtonPress>", hide, add="+")
+
+    def apply_settings(self, data: dict) -> None:
+        """Push persisted settings into the widgets (WP5)."""
+        try:
+            self.denoise_enabled_var.set(bool(data.get("enabled", False)))
+            self.denoise_auto_convert_var.set(bool(data.get("auto_convert", True)))
+            self.denoise_restore_rate_var.set(bool(data.get("restore_original_rate", True)))
+            self.denoise_dual_mono_var.set(bool(data.get("denoise_dual_mono_shortcut", True)))
+            self.denoise_strength_entry.delete(0, "end")
+            self.denoise_strength_entry.insert(0, f"{float(data.get('strength_db', 12.0)):g}")
+            path = data.get("deep_filter_path")
+            if path:
+                self._detect_deep_filter(str(path))
+            self._on_denoise_toggle()
+        except Exception as exc:  # noqa: BLE001 - never fail startup over settings
+            logger.warning("تعذر تطبيق الإعدادات المحفوظة: %s", exc)
+
     def get_denoise_settings(self) -> dict:
         """Collect checkbox state into the settings dict consumed by src.core.denoise."""
         strength_text = normalize_numeric_string(self.denoise_strength_entry.get() or "")
-        strength = 100.0
+        strength = 12.0
         strength_text = strength_text.strip()
         if strength_text:
             try:
@@ -502,7 +548,10 @@ class SplitView(ctk.CTkFrame):
             "strength_db": strength,
             "auto_convert": bool(self.denoise_auto_convert_var.get()),
             "restore_original_rate": bool(self.denoise_restore_rate_var.get()),
-            "workers": int(self.denoise_workers_var.get() or 1),
+            "denoise_dual_mono_shortcut": bool(self.denoise_dual_mono_var.get()),
+            # Kept in the API for programmatic callers; the UI no longer exposes
+            # it because 2 workers measured only 1.25x faster at 2x the RAM.
+            "workers": 1,
             "deep_filter_path": str(self.deep_filter_exe) if self.deep_filter_exe else None,
         }
 
@@ -573,6 +622,7 @@ class SplitView(ctk.CTkFrame):
         denoise_state = state if tool_found else "disabled"
         self.denoise_checkbox.configure(state=denoise_state)
         self.denoise_auto_convert_cb.configure(state=denoise_state)
+        self.denoise_dual_mono_cb.configure(state=denoise_state)
         self.denoise_strength_entry.configure(state=denoise_state)
         self.denoise_browse_btn.configure(state=denoise_state)
         self.denoise_redetect_btn.configure(state=denoise_state)
@@ -607,13 +657,25 @@ class SplitView(ctk.CTkFrame):
         color = "#D32F2F" if is_error else ("#388E3C" if is_success else "gray")
         self.status_label.configure(text=text, text_color=color)
 
-    def show_success_result(self, result: SplitResult, extra_lines: Optional[list[str]] = None) -> None:
+    def show_success_result(
+        self,
+        result: SplitResult,
+        extra_lines: Optional[list[str]] = None,
+        denoise_warning: bool = False,
+    ) -> None:
         self.last_result = result
         self.open_folder_btn.configure(state="normal")
         self.progress_bar.set(1.0)
         self.percent_label.configure(text="100%")
         media_name = "الملف الصوتي" if result.is_audio_only else "الفيديو"
-        self.set_status(f"اكتمل تقسيم {media_name} بنجاح!", is_success=True)
+        if denoise_warning:
+            # The split succeeded; only the noise reduction had problems (WP6).
+            self.set_status(
+                f"اكتمل تقسيم {media_name}، لكن تقليل الضوضاء لم يكتمل لكل الأجزاء.",
+                is_error=False,
+            )
+        else:
+            self.set_status(f"اكتمل تقسيم {media_name} بنجاح!", is_success=True)
 
         lines = [
             f"تم تقسيم {media_name} بنجاح إلى {len(result.parts)} جزء/أجزاء.",
