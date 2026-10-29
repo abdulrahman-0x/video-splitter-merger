@@ -16,6 +16,7 @@ from src.core.ffmpeg_manager import (
     get_ffmpeg_tools,
     is_ffmpeg_available,
 )
+from src.core.denoise import DenoiseError, denoise_parts
 from src.core.merger import MergeResult, VideoMerger
 from src.core.runner import FFmpegRunner
 from src.core.splitter import SplitResult, VideoSplitter
@@ -46,6 +47,9 @@ class App(ctk.CTk):
         self.active_task_type: Optional[str] = None
         self.active_splitter: Optional[VideoSplitter] = None
         self.active_merger: Optional[VideoMerger] = None
+        self.denoise_cancel_event: Optional[threading.Event] = None
+        # Session-only measured RTFs per channel count (the app has no settings persistence).
+        self.denoise_rtf_history: dict[str, list[float]] = {"1": [], "2": []}
 
         self._build_ui()
 
@@ -175,6 +179,11 @@ class App(ctk.CTk):
         splitter = VideoSplitter(runner=runner)
         self.active_splitter = splitter
 
+        denoise_settings = self.split_view.get_denoise_settings()
+        if denoise_settings["enabled"]:
+            self.denoise_cancel_event = threading.Event()
+            denoise_settings["rtf_history"] = self.denoise_rtf_history
+
         def worker() -> None:
             try:
                 def on_prog(pct: float, cur_sec: float) -> None:
@@ -186,7 +195,25 @@ class App(ctk.CTk):
                     output_parent_dir=output_dir,
                     progress_callback=on_prog,
                 )
-                self.msg_queue.put(("SPLIT_SUCCESS", result))
+
+                extra_lines: Optional[list[str]] = None
+                if denoise_settings["enabled"]:
+                    def on_denoise_prog(pct: float, message: str) -> None:
+                        self.msg_queue.put(("DENOISE_PROGRESS", (pct, message)))
+
+                    report = denoise_parts(
+                        parts=[(p.file_path, p.duration) for p in result.parts],
+                        settings=denoise_settings,
+                        cancel_event=self.denoise_cancel_event,
+                        progress_callback=on_denoise_prog,
+                    )
+                    for channels_key, rtfs in report.measured_rtfs.items():
+                        history = self.denoise_rtf_history.setdefault(str(int(channels_key)), [])
+                        history.extend(float(r) for r in rtfs)
+                        history[:] = history[-8:]  # session cap
+                    extra_lines = report.summary_lines() or None
+
+                self.msg_queue.put(("SPLIT_SUCCESS", (result, extra_lines)))
             except InterruptedError:
                 self.msg_queue.put(("SPLIT_CANCELLED", None))
             except Exception as exc:
@@ -236,6 +263,8 @@ class App(ctk.CTk):
         """Cancel whatever background task is running."""
         if self.active_runner:
             self.active_runner.cancel()
+        if self.denoise_cancel_event:
+            self.denoise_cancel_event.set()
         if self.active_task_type == "SPLIT":
             self.split_view.set_status("جاري إلغاء العملية وتنظيف الملفات...", is_error=True)
         elif self.active_task_type == "MERGE":
@@ -248,6 +277,7 @@ class App(ctk.CTk):
             self.active_runner = None
             self.active_splitter = None
             self.active_merger = None
+            self.denoise_cancel_event = None
 
         self.split_view.set_running_state(is_busy)
         self.merge_view.set_running_state(is_busy)
@@ -262,9 +292,14 @@ class App(ctk.CTk):
                     pct, cur_sec = data
                     self.split_view.update_progress(pct, cur_sec)
 
+                elif msg_type == "DENOISE_PROGRESS":
+                    pct, message = data
+                    self.split_view.set_denoise_progress(pct, message)
+
                 elif msg_type == "SPLIT_SUCCESS":
                     self._set_app_busy(False)
-                    self.split_view.show_success_result(data)
+                    result, extra_lines = data if isinstance(data, tuple) and len(data) == 2 else (data, None)
+                    self.split_view.show_success_result(result, extra_lines=extra_lines)
 
                 elif msg_type == "SPLIT_ERROR":
                     self._set_app_busy(False)

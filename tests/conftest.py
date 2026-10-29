@@ -94,7 +94,9 @@ def create_synthetic_video(
         sub_idx = 3 if extra_audio else 2
         inputs += ["-i", str(srt_file)]
         maps += ["-map", f"{sub_idx}:s:0"]
-        sub_encoding = ["-c:s", "srt"]
+        # mp4-family containers reject the srt codec; they need mov_text.
+        sub_codec = "mov_text" if output_path.suffix.lower() in (".mp4", ".m4v", ".mov") else "srt"
+        sub_encoding = ["-c:s", sub_codec]
 
     # Assemble complete command
     cmd = [
