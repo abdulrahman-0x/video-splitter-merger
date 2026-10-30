@@ -22,9 +22,9 @@ Wraps the external `deep-filter` command-line tool (DeepFilterNet3, tested with
 3. The pipeline pads with that noise, runs with `-D`, then trims back to the
    exact original sample count (`atrim=end_sample=N48,apad=whole_len=N48`).
    A content check after the tool run catches a regression (see
-   `_tail_is_damaged`): if the source tail is audible and the output tail is
-   digital silence, the last 1440 samples are restored from the source with a
-   5 ms crossfade instead of shipping a hole.
+   `tail_hole_detected`): if the source content tail is audible and the output
+   ends in >= 100 digital-zero samples, the last 1440 samples are restored from
+   the source with a 5 ms crossfade instead of shipping a hole.
 4. `-a 0` is a bit-exact passthrough that mis-aligns when combined with `-D`:
    strength <= 0 is treated as "feature off" and the tool is never launched.
 5. The tool emits no progress; the caller estimates ETA with
@@ -337,11 +337,18 @@ def build_padded_input_filter(downmix_mono: bool = False, src_channels: int = 2,
 
 
 def pcm16_rms_from_wav(path: Path, max_seconds: float = 0.1,
-                       from_end: bool = True) -> Optional[float]:
-    """RMS (0..1) of the first/last `max_seconds` of a 16-bit PCM WAV, no deps.
+                       from_end: bool = True,
+                       skip_frames_from_end: int = 0) -> Optional[float]:
+    """RMS (0..1) of a 16-bit PCM WAV window, no deps.
 
     Used to detect a damaged tail: the tool writes digital zeros there, so the
     measured RMS is exactly 0.0 when the loss happened.
+
+    `skip_frames_from_end` shifts the window back from the end of the data.
+    The conformed source is `content + 0.1 s noise pad`, so measuring its
+    literal last 100 ms would measure the PAD (a constant ~0.0018 RMS) and
+    every tail would look "audible". Pass the pad length to measure the real
+    content tail instead.
     """
     try:
         raw = path.read_bytes()
@@ -367,8 +374,11 @@ def pcm16_rms_from_wav(path: Path, max_seconds: float = 0.1,
     n_frames = (end - data_off) // frame_bytes
     if n_frames <= 0:
         return None
-    n = min(n_frames, max(1, int(max_seconds * 48000)))
-    start = data_off + (n_frames - n) * frame_bytes if from_end else data_off
+    usable = max(0, n_frames - max(0, int(skip_frames_from_end)))
+    if usable <= 0:
+        return None
+    n = min(usable, max(1, int(max_seconds * 48000)))
+    start = data_off + (usable - n) * frame_bytes if from_end else data_off
     chunk = raw[start:start + n * frame_bytes]
     samples = memoryview(chunk).cast("h")
     if not samples:
@@ -379,28 +389,98 @@ def pcm16_rms_from_wav(path: Path, max_seconds: float = 0.1,
     return math.sqrt(total / len(samples))
 
 
-def tail_is_damaged(source_tail_rms: Optional[float], output_tail_rms: Optional[float],
-                    silence_floor: float = 1e-7) -> bool:
-    """True when the source tail is audible but the output tail is digital silence."""
-    if source_tail_rms is None or output_tail_rms is None:
+def pcm16_trailing_zero_frames(path: Path, max_frames: int = 0) -> Optional[int]:
+    """Number of trailing all-zero frames (samples across all channels) in a WAV.
+
+    The tool's failure mode is a *short* zero run (1440 samples = 30 ms at
+    48 kHz), so an RMS over a 100 ms window is the wrong instrument: the other
+    70 ms of real audio keeps the RMS high and the hole goes unnoticed. Counting
+    the zero run detects it exactly.
+
+    `max_frames` bounds the scan (0 = whole file). Returns None if unreadable.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if raw[0:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return None
+    pos, channels, bits, data_off, data_size = 12, None, None, None, None
+    while pos + 8 <= len(raw):
+        cid = raw[pos:pos + 4]
+        csize = int.from_bytes(raw[pos + 4:pos + 8], "little")
+        if cid == b"fmt ":
+            channels = int.from_bytes(raw[pos + 10:pos + 12], "little")
+            bits = int.from_bytes(raw[pos + 22:pos + 24], "little")
+        elif cid == b"data":
+            data_off, data_size = pos + 8, csize
+            break
+        pos += 8 + csize + (csize & 1)
+    if data_off is None or not channels or bits != 16:
+        return None
+    end = min(len(raw), data_off + data_size)
+    frame_bytes = 2 * channels
+    n_frames = (end - data_off) // frame_bytes
+    if n_frames <= 0:
+        return None
+    # Read backwards in chunks; stop at the first non-zero frame.
+    limit = n_frames if max_frames <= 0 else min(n_frames, int(max_frames))
+    zero = b"\x00" * frame_bytes
+    counted = 0
+    idx = n_frames
+    while counted < limit and idx > 0:
+        take = min(4096, idx, limit - counted)
+        start = data_off + (idx - take) * frame_bytes
+        chunk = raw[start:start + take * frame_bytes]
+        if len(chunk) != take * frame_bytes:
+            break
+        # Count zero frames from the end of this chunk.
+        trimmed = 0
+        while trimmed < take and chunk[(take - 1 - trimmed) * frame_bytes:
+                                       (take - trimmed) * frame_bytes] == zero:
+            trimmed += 1
+        counted += trimmed
+        if trimmed < take:
+            break
+        idx -= take
+    return counted
+
+
+def tail_hole_detected(source_content_tail_rms: Optional[float],
+                       trailing_zero_frames: Optional[int],
+                       min_zero_frames: int = 100,
+                       audible_floor: float = 0.001) -> bool:
+    """True when audible source content is followed by a run of digital zeros.
+
+    This is the check the spec asks for (>= 100 trailing zero samples while the
+    source tail is above -60 dBFS). `source_content_tail_rms` must be measured
+    on the CONTENT, i.e. excluding the appended noise pad.
+    """
+    if source_content_tail_rms is None or trailing_zero_frames is None:
         return False
-    return source_tail_rms > 0.001 and output_tail_rms <= silence_floor
+    return source_content_tail_rms > audible_floor and trailing_zero_frames >= min_zero_frames
 
 
 def crossfade_tail_filter(n48: int, crossfade_samples: int = TAIL_RESTORE_CROSSFADE_SAMPLES) -> str:
     """Filter restoring the last `DF_DELAY_SAMPLES` from the source, 5 ms crossfade.
 
-    Inputs: 0 = denoised output (length n48), 1 = conformed source (length n48).
+    Inputs: 0 = denoised output, 1 = conformed (padded) source.
     Output: denoised for [0, n48-d), then a crossfade into the source for the
     final d samples, so `samples_out == samples_in` and there is no hole.
+
+    Both tail branches are trimmed to exactly `d` samples. Input 1 is the padded
+    source, so it must NOT be read past `n48` or the -55 dBFS pad leaks into the
+    output (that made the file 4800 samples too long and put the noise in the
+    tail). `head` is [0, cut) and `blend` is [cut, cut+d), so the concat is
+    exactly `n48` samples.
     """
     d = DF_DELAY_SAMPLES
     cut = max(0, n48 - d)
     cf = max(1, int(crossfade_samples))
     return (
         f"[0:a]atrim=end_sample={cut},asetpts=N/SR/TB[head];"
-        f"[0:a]atrim=start_sample={cut},asetpts=N/SR/TB[td];"
-        f"[1:a]atrim=start_sample={cut},asetpts=N/SR/TB[ts];"
+        f"[0:a]atrim=start_sample={cut}:end_sample={cut + d},asetpts=N/SR/TB[td];"
+        f"[1:a]atrim=start_sample={cut}:end_sample={cut + d},asetpts=N/SR/TB[ts];"
         f"[td]afade=t=out:st=0:d={cf / 48000:.9f}:curve=tri[tdf];"
         f"[ts]afade=t=in:st=0:d={cf / 48000:.9f}:curve=tri[tsf];"
         f"[tdf][tsf]amix=inputs=2:duration=longest:normalize=0[blend];"
@@ -702,15 +782,21 @@ def denoise_wav(
             )
 
         # WP1 content check: a length check alone cannot see a zeroed tail.
-        # Compare the audible tail of the source with the tail the tool produced.
-        source_tail_rms = pcm16_rms_from_wav(in_wav, max_seconds=0.1, from_end=True)
+        # The tool's failure mode is a 1440-sample zero run at the very end, so
+        # count the trailing zero frames instead of averaging a 100 ms window
+        # (70 ms of real audio would hide the hole). The source window must skip
+        # the appended noise pad, or the pad itself looks like audible content.
+        source_tail_rms = pcm16_rms_from_wav(
+            in_wav, max_seconds=0.1, from_end=True, skip_frames_from_end=PAD_SAMPLES_48K
+        )
         output_tail_rms = pcm16_rms_from_wav(df_out, max_seconds=0.1, from_end=True)
+        trailing_zeros = pcm16_trailing_zero_frames(df_out)
         tail_restored = False
-        if tail_is_damaged(source_tail_rms, output_tail_rms):
+        if tail_hole_detected(source_tail_rms, trailing_zeros):
             logger.warning(
-                "خرج الأداة ينتهي بصمت رقمي بينما نهاية المصدر مسموعة (RMS %.5f)؛ "
-                "تُستعاد آخر %d عينة من المصدر مع تداخل 5 مللي ثانية.",
-                source_tail_rms, DF_DELAY_SAMPLES,
+                "خرج الأداة ينتهي بصمت رقمي (%s عينة صفرية) بينما نهاية المصدر مسموعة "
+                "(RMS %.5f)؛ تُستعاد آخر %d عينة من المصدر مع تداخل 5 مللي ثانية.",
+                trailing_zeros, source_tail_rms, DF_DELAY_SAMPLES,
             )
             tail_restored = True
 

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import math
+import os
 import shutil
 import struct
 import subprocess
 import wave
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import pytest
 
@@ -18,20 +18,22 @@ from src.core.denoise import (
     DF_DELAY_SAMPLES,
     DenoisePartStatus,
     DenoiseReport,
-    build_padded_input_filter,
     choose_temp_base,
     cleanup_temp_base,
-    estimate_ram_mb,
-    guard_admits,
+    crossfade_tail_filter,
     pcm16_rms_from_wav,
-    tail_is_damaged,
+    pcm16_trailing_zero_frames,
+    tail_hole_detected,
     wav_file_sample_count,
     write_report_file,
 )
-from src.core.ffmpeg_manager import probe_media
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FX_ROOT = PROJECT_ROOT / "tmp" / "dfn_fix_tests"
+# Per-process workspace so two concurrent pytest runs cannot delete each
+# other's fixtures (the previous fixed path caused spurious failures).
+FX_ROOT = Path(
+    os.environ.get("DFN_FIX_TEST_ROOT") or (PROJECT_ROOT / "tmp" / f"dfn_fix_tests_{os.getpid()}")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -132,48 +134,70 @@ class TestTailPrimitives:
         assert pcm16_rms_from_wav(p) is None
         assert pcm16_rms_from_wav(fx_dir / "missing.wav") is None
 
-    def test_tail_is_damaged_matrix(self) -> None:
-        assert tail_is_damaged(0.05, 0.0) is True       # audible source, silent output
-        assert tail_is_damaged(0.05, 0.04) is False     # both audible
-        assert tail_is_damaged(0.0, 0.0) is False       # source itself silent
-        assert tail_is_damaged(0.0001, 0.0) is False    # source effectively silent
-        assert tail_is_damaged(None, 0.0) is False
-        assert tail_is_damaged(0.05, None) is False
+    def test_tail_hole_detected_matrix(self) -> None:
+        # Audible source content followed by a zero run is the bug signature.
+        assert tail_hole_detected(0.05, 1440) is True
+        assert tail_hole_detected(0.05, 100) is True          # boundary is >= 100
+        assert tail_hole_detected(0.05, 99) is False          # shorter run: tolerated
+        assert tail_hole_detected(0.05, 0) is False           # healthy output
+        assert tail_hole_detected(0.0, 1440) is False         # source itself silent
+        assert tail_hole_detected(0.0001, 1440) is False      # source effectively silent
+        assert tail_hole_detected(None, 1440) is False
+        assert tail_hole_detected(0.05, None) is False
+
+    def test_pcm16_trailing_zero_frames_counts_frames_not_samples(
+        self, fx_dir: Path
+    ) -> None:
+        """A zero run must be counted in frames, or stereo reports 2x the length."""
+        d = _sub(fx_dir, "zeroframes")
+        mono = _make_wav(d / "mono.wav", [3000] * 4800 + [0] * 1440)
+        assert pcm16_trailing_zero_frames(mono) == 1440
+        # same run in stereo: 1440 frames, i.e. 2880 zero int16 values
+        st = _make_wav(d / "st.wav", [3000, 3000] * 4800 + [0, 0] * 1440, channels=2)
+        assert pcm16_trailing_zero_frames(st) == 1440
+        # a fully silent file and a file with no zero run
+        assert pcm16_trailing_zero_frames(_make_wav(d / "silent.wav", [0] * 200)) == 200
+        assert pcm16_trailing_zero_frames(_make_wav(d / "loud.wav", [3000] * 200)) == 0
+
+    def test_pcm16_rms_skips_the_noise_pad(self, fx_dir: Path) -> None:
+        """The source window must exclude the appended pad, or it always looks audible."""
+        d = _sub(fx_dir, "skippad")
+        content = [3000] * 4800
+        pad = [1, -1] * 2400          # a quiet but non-zero "noise" pad
+        p = _make_wav(d / "padded.wav", content + pad)
+        literal_tail = pcm16_rms_from_wav(p)
+        content_tail = pcm16_rms_from_wav(p, skip_frames_from_end=len(pad))
+        assert literal_tail is not None and content_tail is not None
+        assert literal_tail < 0.001          # the pad, not the audio
+        assert content_tail > 0.05           # the real content tail
+        assert pcm16_rms_from_wav(p, skip_frames_from_end=10**9) is None
+
+    def test_crossfade_filter_trims_both_tail_branches(self) -> None:
+        """Regression: the F-c graph must read exactly d samples from each input.
+
+        The original graph trimmed neither branch, so the second input (the
+        PADDED source) dragged the whole -55 dBFS noise pad into the output:
+        the file came out 4800 samples too long and the "restored" tail was
+        pad noise (corr 0.0 vs the source), not audio.
+        """
+        d = DF_DELAY_SAMPLES
+        n48 = 192000
+        cut = n48 - d
+        graph = crossfade_tail_filter(n48)
+        # both tail branches must be bounded on both ends
+        assert f"[0:a]atrim=start_sample={cut}:end_sample={cut + d}" in graph
+        assert f"[1:a]atrim=start_sample={cut}:end_sample={cut + d}" in graph
+        # the head must stop at the cut so head + blend == n48
+        assert f"[0:a]atrim=end_sample={cut}," in graph
 
 
 # ---------------------------------------------------------------------------
 # WP2: RAM formula and guard
+#
+# The measured-table and guard-decision tests live in tests/test_denoise.py
+# (TestPureHelpers::test_estimate_ram_mb / test_guard_admits); they are not
+# duplicated here.
 # ---------------------------------------------------------------------------
-
-class TestRamModel:
-    def test_formula_matches_measured_table(self) -> None:
-        measured = {
-            (120.0, 1): 96.1, (600.0, 1): 259.7, (1800.0, 1): 699.3,
-            (120.0, 2): 174.5, (600.0, 2): 701.7, (1200.1, 2): 1360.7,
-            (1800.0, 2): 2020.2,
-        }
-        for (dur, ch), actual in measured.items():
-            assert abs(estimate_ram_mb(dur, ch) - actual) / actual <= 0.05
-
-    def test_dual_mono_uses_mono_cost(self) -> None:
-        # The shortcut must be priced as 1 channel.
-        assert estimate_ram_mb(600, 1) < estimate_ram_mb(600, 2) / 2.5
-
-    def test_guard_decision_table(self) -> None:
-        cases = [
-            # (duration, channels, avail, admitted)
-            (600, 1, 2700, True),
-            (600, 2, 2700, True),
-            (1800, 1, 2700, True),
-            (1800, 2, 2700, False),
-            (1200, 2, 2700, True),
-            (600, 2, 1200, False),   # limit 432 MB < 804 MB needed
-            (60, 1, 900, True),
-            (600, 1, 800, False),    # limit 32 MB
-        ]
-        for dur, ch, avail, expected in cases:
-            ok, est, limit = guard_admits(dur, ch, avail)
-            assert ok is expected, (dur, ch, avail, ok, est, limit)
 
 
 # ---------------------------------------------------------------------------
@@ -555,3 +579,51 @@ class TestTailWithRealTool:
             seg = np.abs(np.diff(cat[max(0, j - 48000):j + 48000]))
             reference = max(float(np.percentile(seg, 99)), src_jump)
             assert jump <= 3.0 * reference, (k, jump, reference, src_jump)
+
+    def test_fc_fallback_restores_source_tail_at_exact_length(
+        self, fx_dir: Path, df_exe: Path, ffmpeg_tools: Tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression (2026-10-30): the F-c safety net produced garbage.
+
+        `crossfade_tail_filter` trimmed neither branch, so input 1 (the PADDED
+        source) contributed its whole -55 dBFS noise pad: the output was 4800
+        samples too long and the restored tail was pad noise (corr ~0.0 with the
+        source). Forcing the branch on must yield exact length and a tail that
+        is genuinely the source audio.
+        """
+        np = pytest.importorskip("numpy")
+        from src.core import denoise as dn
+
+        ffmpeg, ffprobe = ffmpeg_tools
+        d = _sub(fx_dir, "wp1_fc")
+        n = 4 * 48000
+        t = np.arange(n) / 48000.0
+        rng = np.random.default_rng(7)
+        sig = 0.25 * np.sin(2 * np.pi * 330 * t) + 0.05 * rng.standard_normal(n)
+        src = d / "fc_src.wav"
+        pcm = (np.clip(sig, -1, 1) * 32767).astype("<i2")
+        with wave.open(str(src), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(pcm.tobytes())
+
+        # Force the safety net regardless of what the tool does.
+        monkeypatch.setattr(dn, "tail_hole_detected", lambda *a, **k: True)
+        dst = d / "fc_out.wav"
+        info = dn.denoise_wav(src, dst, strength_db=12, exe=df_exe, ffmpeg=ffmpeg,
+                              ffprobe=ffprobe, temp_base=fx_dir)
+        assert info["tail_restored"] is True
+
+        out = _read_wav(dst)[:, 0]
+        src_x = _read_wav(src)[:, 0]
+        assert len(out) == len(src_x) == n, "the fallback changed the length"
+        assert _trailing_zeros(out, 4800) <= 2
+
+        # The restored window must be the source audio, not the noise pad.
+        dd = dn.DF_DELAY_SAMPLES
+        corr = float(np.corrcoef(out[-dd:], src_x[-dd:])[0, 1])
+        assert corr > 0.9, corr
+        tail_rms = float(np.sqrt(np.mean(out[-4800:] ** 2)))
+        assert tail_rms > 0.01, tail_rms

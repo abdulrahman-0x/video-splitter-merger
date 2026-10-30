@@ -318,9 +318,14 @@ class TestAudioUserFailureScenarios:
         assert is_audio_file(test_file) is True
 
     def test_gui_split_view_displays_audio_metadata_on_selection(
-        self, require_ffmpeg: tuple[Path, Path], tmp_path: Path
+        self, require_ffmpeg: tuple[Path, Path], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Selecting an audio file in SplitView updates the metadata label with audio information."""
+        """Selecting an audio file in SplitView updates the metadata label.
+
+        Drives the real `_on_browse_file` path (the file dialog is the one
+        boundary stubbed out) and asserts on the label the user actually sees.
+        """
         ffmpeg_bin, _ = require_ffmpeg
 
         audio = tmp_path / "lecture.mp3"
@@ -329,15 +334,17 @@ class TestAudioUserFailureScenarios:
         app = App()
         app.update()
         try:
-            # Trigger file selection handler
-            app.split_view.selected_file = audio
-            app.split_view._handle_selected_file(audio) if hasattr(app.split_view, "_handle_selected_file") else None
+            monkeypatch.setattr(
+                "src.gui.split_view.filedialog.askopenfilename", lambda **_: str(audio)
+            )
+            app.split_view._on_browse_file()
+            app.update()
 
-            # Or simulate probe directly as SplitView does
-            probe = probe_media(audio)
-            assert probe["is_audio_only"] is True
-            assert probe["audio_streams"][0]["codec_name"] == "mp3"
-            assert probe["audio_streams"][0]["channels"] == 2
+            assert app.split_view.selected_file == audio.resolve()
+            info_text = app.split_view.file_info_label.cget("text")
+            # The label must report the audio specifics, not just the file name.
+            assert "MP3" in info_text.upper()
+            assert "44100" in info_text or "44.1" in info_text
         finally:
             app.destroy()
 

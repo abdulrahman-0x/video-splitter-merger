@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,7 +15,11 @@ from src.core.denoise import denoise_parts, wav_file_sample_count
 from src.core.ffmpeg_manager import find_tool
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FX_ROOT = PROJECT_ROOT / "tmp" / "dfn_int_tests"
+# Per-process workspace so two concurrent pytest runs cannot delete each
+# other's fixtures (the previous fixed path caused spurious failures).
+FX_ROOT = Path(
+    os.environ.get("DFN_INT_TEST_ROOT") or (PROJECT_ROOT / "tmp" / f"dfn_int_tests_{os.getpid()}")
+)
 
 
 @pytest.fixture(scope="session")

@@ -33,7 +33,6 @@ from src.core.denoise import (
     DF_EXIT_OOM,
     PAD_RMS_DBFS,
     PAD_SAMPLES_48K,
-    RAM_INTERCEPT_MB,
     DenoiseError,
     DenoisePartStatus,
     DenoiseReport,
@@ -43,7 +42,6 @@ from src.core.denoise import (
     _map_df_failure,
     build_df_args,
     build_padded_input_filter,
-    choose_temp_base,
     compute_n48,
     denoise_parts,
     denoise_wav,
@@ -52,16 +50,19 @@ from src.core.denoise import (
     get_version,
     guard_admits,
     is_conformant_wav,
-    pcm16_rms_from_wav,
     ram_guard_limit_mb,
-    tail_is_damaged,
     wav_file_sample_count,
 )
 from src.core.ffmpeg_manager import probe_media
 from tests.conftest import create_synthetic_video
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FX_ROOT = PROJECT_ROOT / "tmp" / "dfn_tests"
+# Per-process workspace: a fixed path here makes two concurrent pytest runs
+# delete each other's files mid-test (seen 2026-10-30 as spurious "file not
+# found" / "tool exited 1" failures). F: keeps C: usage at zero.
+FX_ROOT = Path(
+    os.environ.get("DFN_TEST_ROOT") or (PROJECT_ROOT / "tmp" / f"dfn_tests_{os.getpid()}")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +639,7 @@ class TestDeepFilterRun:
         ffmpeg, ffprobe = require_ffmpeg
         d = _sub(fx_dir, "r441")
         src = _gen_sine_wav(ffmpeg, d / "src.wav", duration=8.0, rate=44100, channels=2)
-        res = denoise_wav(
+        denoise_wav(
             src, d / "out.wav", 12,
             exe=df_exe, ffmpeg=ffmpeg, ffprobe=ffprobe, temp_base=str(d),
         )
@@ -653,7 +654,7 @@ class TestDeepFilterRun:
         ffmpeg, ffprobe = require_ffmpeg
         d = _sub(fx_dir, "nrst")
         src = _gen_sine_wav(ffmpeg, d / "src.wav", duration=8.0, rate=44100, channels=2)
-        res = denoise_wav(
+        denoise_wav(
             src, d / "out.wav", 12, restore_original_rate=False,
             exe=df_exe, ffmpeg=ffmpeg, ffprobe=ffprobe, temp_base=str(d),
         )
@@ -667,7 +668,7 @@ class TestDeepFilterRun:
         ffmpeg, ffprobe = require_ffmpeg
         d = _sub(fx_dir, "k16m")
         src = _gen_sine_wav(ffmpeg, d / "src.wav", duration=6.0, rate=16000, channels=1)
-        res = denoise_wav(
+        denoise_wav(
             src, d / "out.wav", 12,
             exe=df_exe, ffmpeg=ffmpeg, ffprobe=ffprobe, temp_base=str(d),
         )
