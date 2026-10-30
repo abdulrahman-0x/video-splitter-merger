@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -12,11 +13,15 @@ import customtkinter as ctk
 
 from src.core.ffmpeg_manager import probe_media
 from src.core.splitter import SplitResult
+from src.core import denoise as denoise_module
 from src.utils.helpers import (
     check_supported_format,
     format_duration,
+    normalize_numeric_string,
     parse_duration_minutes,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SplitView(ctk.CTkFrame):
@@ -139,6 +144,136 @@ class SplitView(ctk.CTkFrame):
             command=self._on_browse_dest,
         )
         self.browse_dest_btn.grid(row=0, column=1, padx=(10, 0))
+
+        # 2b. Noise reduction (DeepFilterNet) section
+        ctk.CTkLabel(
+            options_frame,
+            text="تقليل الضوضاء (DeepFilterNet):",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
+        ).grid(row=3, column=0, sticky="w", padx=15, pady=(4, 4))
+
+        self.denoise_enabled_var = ctk.BooleanVar(value=False)
+        self.denoise_checkbox = ctk.CTkCheckBox(
+            options_frame,
+            text="تشغيل تقليل الضوضاء للأجزاء (بطيء: يعيد ترميز الصوت فقط، والفيديو يُنسخ كما هو)",
+            variable=self.denoise_enabled_var,
+            command=self._on_denoise_toggle,
+            font=ctk.CTkFont(size=12),
+        )
+        self.denoise_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", padx=15, pady=(0, 4))
+
+        strength_row = ctk.CTkFrame(options_frame, fg_color="transparent")
+        strength_row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 2))
+
+        ctk.CTkLabel(
+            strength_row,
+            text="القوة (dB):",
+            font=ctk.CTkFont(size=12),
+            anchor="w",
+        ).pack(side="left")
+
+        self.denoise_strength_entry = ctk.CTkEntry(
+            strength_row,
+            placeholder_text="12",
+            width=70,
+            height=30,
+        )
+        self.denoise_strength_entry.insert(0, "12")
+        self.denoise_strength_entry.pack(side="left", padx=(6, 10))
+
+        # Presets carry numeric labels only; the measured numbers live in the
+        # tooltip/status text (WP8). Noise-floor change / loudness change.
+        self.preset_hints = {
+            "6": "6 dB: أرضية الضوضاء -6.1 dB، الجهارة -4.0 LU",
+            "12": "12 dB: أرضية الضوضاء -12.0 dB، الجهارة -4.1 LU",
+            "20": "20 dB: أرضية الضوضاء -20.0 dB، الجهارة -5.5 LU",
+            "30": "30 dB: أرضية الضوضاء -29.7 dB، الجهارة -6.3 LU",
+            "100": "100 dB: أرضية الضوضاء -54.8 dB، الجهارة -6.5 LU",
+        }
+        for preset in (6, 12, 20, 30, 100):
+            preset_btn = ctk.CTkButton(
+                strength_row,
+                text=str(preset),
+                width=44,
+                height=28,
+                command=lambda value=str(preset): self._on_strength_preset(value),
+            )
+            preset_btn.pack(side="left", padx=(0, 6))
+            self._attach_tooltip(preset_btn, self.preset_hints[str(preset)])
+
+        ctk.CTkLabel(
+            options_frame,
+            text="القيم فوق 70 تكاد تشبه 100. جرّب عينة قصيرة أولاً.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            anchor="w",
+        ).grid(row=6, column=0, columnspan=2, sticky="w", padx=15, pady=(0, 4))
+
+        toggles_row = ctk.CTkFrame(options_frame, fg_color="transparent")
+        toggles_row.grid(row=7, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 2))
+
+        self.denoise_auto_convert_var = ctk.BooleanVar(value=True)
+        self.denoise_auto_convert_cb = ctk.CTkCheckBox(
+            toggles_row,
+            text="تحويل تلقائي إلى 48 كيلوهرتز / 16-بت عند الحاجة",
+            variable=self.denoise_auto_convert_var,
+            command=self._on_denoise_toggle,
+            font=ctk.CTkFont(size=12),
+        )
+        self.denoise_auto_convert_cb.pack(side="left")
+
+        self.denoise_restore_rate_var = ctk.BooleanVar(value=True)
+        self.denoise_restore_rate_cb = ctk.CTkCheckBox(
+            toggles_row,
+            text="إرجاع معدل العينات الأصلي بعد المعالجة",
+            variable=self.denoise_restore_rate_var,
+            font=ctk.CTkFont(size=12),
+        )
+        self.denoise_restore_rate_cb.pack(side="left", padx=(16, 0))
+
+        # WP3: dual-mono shortcut (default on).
+        self.denoise_dual_mono_var = ctk.BooleanVar(value=True)
+        self.denoise_dual_mono_cb = ctk.CTkCheckBox(
+            options_frame,
+            text="اكتشاف القناتين المتطابقتين ومعالجتهما كقناة واحدة (أسرع وأقل ذاكرة)",
+            variable=self.denoise_dual_mono_var,
+            font=ctk.CTkFont(size=12),
+        )
+        self.denoise_dual_mono_cb.grid(row=8, column=0, columnspan=2, sticky="w", padx=15, pady=(2, 6))
+
+        df_status_row = ctk.CTkFrame(options_frame, fg_color="transparent")
+        df_status_row.grid(row=9, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 10))
+
+        self.denoise_status_label = ctk.CTkLabel(
+            df_status_row,
+            text="جاري فحص أداة تقليل الضوضاء...",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            anchor="w",
+        )
+        self.denoise_status_label.pack(side="left")
+
+        self.denoise_browse_btn = ctk.CTkButton(
+            df_status_row,
+            text="استعراض للملف...",
+            width=130,
+            height=28,
+            state="normal",
+            command=self._on_browse_deep_filter,
+        )
+        self.denoise_browse_btn.pack(side="right")
+
+        self.denoise_redetect_btn = ctk.CTkButton(
+            df_status_row,
+            text="إعادة كشف",
+            width=100,
+            height=28,
+            command=self._on_redetect_deep_filter,
+        )
+        self.denoise_redetect_btn.pack(side="right", padx=(0, 6))
+
+        self._detect_deep_filter()
 
         # 3. Actions & Progress Section
         action_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -303,6 +438,125 @@ class SplitView(ctk.CTkFrame):
                 text_color="gray",
             )
 
+    # ------- DeepFilterNet (noise reduction) controls -------
+
+    def _detect_deep_filter(self, override: Optional[str] = None) -> Optional[Path]:
+        """Locate the tool, update the status line, and enable/disable the feature."""
+        self.deep_filter_exe: Optional[Path] = denoise_module.find_deep_filter(override)
+        if self.deep_filter_exe:
+            version = denoise_module.get_version(self.deep_filter_exe)
+            self.denoise_status_label.configure(
+                text=f"تم العثور على الأداة {version or 'بإصدار غير معروف'} في {self.deep_filter_exe}",
+                text_color="gray",
+            )
+            self.denoise_checkbox.configure(state="normal")
+        else:
+            self.denoise_status_label.configure(
+                text="لم يتم العثور على deep-filter.exe؛ تقليل الضوضاء غير متاح (ضع الملف في PATH أو حدد مساراً).",
+                text_color="#FFA000",
+            )
+            self.denoise_enabled_var.set(False)
+            self.denoise_checkbox.configure(state="disabled")
+        self._on_denoise_toggle()
+        return self.deep_filter_exe
+
+    def _on_redetect_deep_filter(self) -> None:
+        self._detect_deep_filter(None)
+
+    def _on_browse_deep_filter(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title="اختر ملف deep-filter.exe",
+            filetypes=[("الأدوات التنفيذية", "*.exe"), ("كافة الملفات", "*.*")],
+        )
+        if chosen:
+            self._detect_deep_filter(chosen)
+
+    def _on_denoise_toggle(self) -> None:
+        if not getattr(self, "denoise_restore_rate_cb", None):
+            return
+        if self.denoise_enabled_var.get():
+            rate_state = "normal" if self.denoise_auto_convert_var.get() else "disabled"
+            self.denoise_restore_rate_cb.configure(state=rate_state)
+        else:
+            self.denoise_restore_rate_cb.configure(state="disabled")
+
+    def _on_strength_preset(self, value: str) -> None:
+        self.denoise_strength_entry.delete(0, "end")
+        self.denoise_strength_entry.insert(0, value)
+
+    def _attach_tooltip(self, widget: ctk.CTkBaseClass, text: str) -> None:
+        """Minimal hover tooltip (no extra dependency)."""
+        tip: dict = {"win": None}
+
+        def show(_event=None) -> None:
+            if tip["win"] is not None:
+                return
+            win = ctk.CTkToplevel(widget)
+            win.wm_overrideredirect(True)
+            win.attributes("-topmost", True)
+            label = ctk.CTkLabel(
+                win, text=text, font=ctk.CTkFont(size=11),
+                fg_color="#2b2b2b", text_color="#f0f0f0", corner_radius=4,
+            )
+            label.pack(padx=6, pady=4)
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() - 34
+            win.geometry(f"+{x}+{y}")
+            tip["win"] = win
+
+        def hide(_event=None) -> None:
+            win = tip.get("win")
+            if win is not None:
+                try:
+                    win.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                tip["win"] = None
+
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
+        widget.bind("<ButtonPress>", hide, add="+")
+
+    def apply_settings(self, data: dict) -> None:
+        """Push persisted settings into the widgets (WP5)."""
+        try:
+            self.denoise_enabled_var.set(bool(data.get("enabled", False)))
+            self.denoise_auto_convert_var.set(bool(data.get("auto_convert", True)))
+            self.denoise_restore_rate_var.set(bool(data.get("restore_original_rate", True)))
+            self.denoise_dual_mono_var.set(bool(data.get("denoise_dual_mono_shortcut", True)))
+            self.denoise_strength_entry.delete(0, "end")
+            self.denoise_strength_entry.insert(0, f"{float(data.get('strength_db', 12.0)):g}")
+            path = data.get("deep_filter_path")
+            # Re-detect even without a saved path: detection already ran during
+            # _build_ui, but setting `enabled` above would otherwise leave the
+            # checkbox checked-and-disabled when the tool is not on PATH.
+            self._detect_deep_filter(str(path) if path else None)
+            self._on_denoise_toggle()
+        except Exception as exc:  # noqa: BLE001 - never fail startup over settings
+            logger.warning("تعذر تطبيق الإعدادات المحفوظة: %s", exc)
+
+    def get_denoise_settings(self) -> dict:
+        """Collect checkbox state into the settings dict consumed by src.core.denoise."""
+        strength_text = normalize_numeric_string(self.denoise_strength_entry.get() or "")
+        strength = 12.0
+        strength_text = strength_text.strip()
+        if strength_text:
+            try:
+                strength = float(strength_text)
+            except ValueError:
+                strength = float("nan")
+        return {
+            "enabled": bool(self.denoise_enabled_var.get()),
+            "strength_db": strength,
+            "auto_convert": bool(self.denoise_auto_convert_var.get()),
+            "restore_original_rate": bool(self.denoise_restore_rate_var.get()),
+            "denoise_dual_mono_shortcut": bool(self.denoise_dual_mono_var.get()),
+            # Kept in the API for programmatic callers; the UI no longer exposes
+            # it because 2 workers measured only 1.25x faster at 2x the RAM.
+            "workers": 1,
+            "deep_filter_path": str(self.deep_filter_exe) if self.deep_filter_exe else None,
+        }
+
     def _on_start_click(self) -> None:
         if not self.selected_file or not self.selected_file.is_file():
             self.set_status("يرجى اختيار ملف فيديو صالح أولاً.", is_error=True)
@@ -324,6 +578,29 @@ class SplitView(ctk.CTkFrame):
             )
             return
 
+        denoise_settings = self.get_denoise_settings()
+        if denoise_settings["enabled"]:
+            if not self.deep_filter_exe:
+                self.set_status(
+                    "تعذر بدء العملية: تقليل الضوضاء مفعل لكن أداة deep-filter غير موجودة.",
+                    is_error=True,
+                )
+                return
+            # Reject NaN and +/-inf here too: `denoise_wav` refuses them only
+            # after the whole split has run, so every part would fail.
+            if not (0 < denoise_settings["strength_db"] < float("inf")):
+                self.set_status(
+                    "قوة تقليل الضوضاء غير صالحة: أدخل قيمة بين 1 و 100 (أو ألغِ تفعيل الخيار).",
+                    is_error=True,
+                )
+                return
+            above = denoise_settings["strength_db"] > 100
+            if above:
+                self.set_status(
+                    "قوة تقليل الضوضاء أكبر من 100؛ سيتم استخدام 100 (الحد الأقصى للتأثير).",
+                    is_error=False,
+                )
+
         self.on_start_split(self.selected_file, segment_seconds, self.custom_output_dir)
 
     def _on_cancel_click(self) -> None:
@@ -344,6 +621,21 @@ class SplitView(ctk.CTkFrame):
         self.browse_dest_btn.configure(state=state)
         self.duration_entry.configure(state=state)
         self.cancel_btn.configure(state="normal" if is_running else "disabled")
+        # DeepFilterNet controls
+        tool_found = self.deep_filter_exe is not None
+        denoise_state = state if tool_found else "disabled"
+        self.denoise_checkbox.configure(state=denoise_state)
+        self.denoise_auto_convert_cb.configure(state=denoise_state)
+        self.denoise_dual_mono_cb.configure(state=denoise_state)
+        self.denoise_strength_entry.configure(state=denoise_state)
+        self.denoise_browse_btn.configure(state=denoise_state)
+        self.denoise_redetect_btn.configure(state=denoise_state)
+        if is_running or not self.denoise_enabled_var.get():
+            self.denoise_restore_rate_cb.configure(state="disabled")
+        else:
+            self.denoise_restore_rate_cb.configure(
+                state="normal" if self.denoise_auto_convert_var.get() else "disabled"
+            )
 
     def update_progress(self, percent: float, current_time_sec: float) -> None:
         """Update progress bar and percentage display."""
@@ -355,17 +647,39 @@ class SplitView(ctk.CTkFrame):
             text_color="gray",
         )
 
+    def set_denoise_progress(self, percent: float, message: str) -> None:
+        """Show noise-reduction progress (estimated, the tool emits none)."""
+        norm = max(0.0, min(1.0, percent / 100.0))
+        self.progress_bar.set(norm)
+        self.percent_label.configure(text=f"{percent:.1f}%")
+        self.status_label.configure(
+            text=f"جاري تقليل الضوضاء (DeepFilterNet)... {message}",
+            text_color="gray",
+        )
+
     def set_status(self, text: str, is_error: bool = False, is_success: bool = False) -> None:
         color = "#D32F2F" if is_error else ("#388E3C" if is_success else "gray")
         self.status_label.configure(text=text, text_color=color)
 
-    def show_success_result(self, result: SplitResult) -> None:
+    def show_success_result(
+        self,
+        result: SplitResult,
+        extra_lines: Optional[list[str]] = None,
+        denoise_warning: bool = False,
+    ) -> None:
         self.last_result = result
         self.open_folder_btn.configure(state="normal")
         self.progress_bar.set(1.0)
         self.percent_label.configure(text="100%")
         media_name = "الملف الصوتي" if result.is_audio_only else "الفيديو"
-        self.set_status(f"اكتمل تقسيم {media_name} بنجاح!", is_success=True)
+        if denoise_warning:
+            # The split succeeded; only the noise reduction had problems (WP6).
+            self.set_status(
+                f"اكتمل تقسيم {media_name}، لكن تقليل الضوضاء لم يكتمل لكل الأجزاء.",
+                is_error=False,
+            )
+        else:
+            self.set_status(f"اكتمل تقسيم {media_name} بنجاح!", is_success=True)
 
         lines = [
             f"تم تقسيم {media_name} بنجاح إلى {len(result.parts)} جزء/أجزاء.",
@@ -376,6 +690,10 @@ class SplitView(ctk.CTkFrame):
         ]
         for idx, part in enumerate(result.parts, start=1):
             lines.append(f"  الجزء {idx:02d}: {part.file_path.name} | المدة: {format_duration(part.duration)}")
+
+        lines.append("")
+        if extra_lines:
+            lines.extend(extra_lines)
 
         if result.has_deviation_warning:
             lines.append("")

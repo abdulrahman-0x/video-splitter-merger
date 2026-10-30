@@ -16,8 +16,11 @@ from src.core.ffmpeg_manager import (
     get_ffmpeg_tools,
     is_ffmpeg_available,
 )
+from src.core.denoise import DenoiseError, denoise_parts
 from src.core.merger import MergeResult, VideoMerger
 from src.core.runner import FFmpegRunner
+from src.core.settings import load as load_settings
+from src.core.settings import save as save_settings
 from src.core.splitter import SplitResult, VideoSplitter
 from src.gui.merge_view import MergeView
 from src.gui.split_view import SplitView
@@ -46,8 +49,14 @@ class App(ctk.CTk):
         self.active_task_type: Optional[str] = None
         self.active_splitter: Optional[VideoSplitter] = None
         self.active_merger: Optional[VideoMerger] = None
+        self.denoise_cancel_event: Optional[threading.Event] = None
+        # Measured RTFs per channel count, persisted (capped at 8 each).
+        self.denoise_rtf_history: dict[str, list[float]] = {"1": [], "2": []}
 
         self._build_ui()
+
+        # WP5: restore the denoise settings the user last used.
+        self._load_persisted_settings()
 
         # Handle window closing safely
         self.protocol("WM_DELETE_WINDOW", self._on_window_close)
@@ -57,6 +66,30 @@ class App(ctk.CTk):
 
         # Check FFmpeg on startup after window is displayed
         self.after(300, self._check_ffmpeg_on_startup)
+
+    def _load_persisted_settings(self) -> None:
+        """Apply the saved denoise settings and RTF history (never fails startup)."""
+        try:
+            data = load_settings()
+            self.denoise_rtf_history = {
+                "1": list(data.get("rtf_history", {}).get("1", []))[-8:],
+                "2": list(data.get("rtf_history", {}).get("2", []))[-8:],
+            }
+            self.split_view.apply_settings(data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("تعذر تحميل الإعدادات المحفوظة: %s", exc)
+
+    def _collect_settings(self) -> dict:
+        """Settings dict as persisted (denoise controls + RTF history)."""
+        settings = self.split_view.get_denoise_settings()
+        settings["rtf_history"] = self.denoise_rtf_history
+        return settings
+
+    def _save_settings(self) -> None:
+        try:
+            save_settings(self._collect_settings())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("تعذر حفظ الإعدادات: %s", exc)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -175,6 +208,14 @@ class App(ctk.CTk):
         splitter = VideoSplitter(runner=runner)
         self.active_splitter = splitter
 
+        denoise_settings = self.split_view.get_denoise_settings()
+        if denoise_settings["enabled"]:
+            self.denoise_cancel_event = threading.Event()
+            denoise_settings["rtf_history"] = self.denoise_rtf_history
+            # WP4: temp lives in the parts folder; the pipeline resolves it from
+            # parts_dir, which is only known after the split.
+            self._save_settings()
+
         def worker() -> None:
             try:
                 def on_prog(pct: float, cur_sec: float) -> None:
@@ -186,7 +227,30 @@ class App(ctk.CTk):
                     output_parent_dir=output_dir,
                     progress_callback=on_prog,
                 )
-                self.msg_queue.put(("SPLIT_SUCCESS", result))
+
+                extra_lines: Optional[list[str]] = None
+                denoise_warning = False
+                if denoise_settings["enabled"]:
+                    def on_denoise_prog(pct: float, message: str) -> None:
+                        self.msg_queue.put(("DENOISE_PROGRESS", (pct, message)))
+
+                    denoise_settings["parts_dir"] = str(result.parts_dir)
+                    report = denoise_parts(
+                        parts=[(p.file_path, p.duration) for p in result.parts],
+                        settings=denoise_settings,
+                        cancel_event=self.denoise_cancel_event,
+                        progress_callback=on_denoise_prog,
+                    )
+                    for channels_key, rtfs in report.measured_rtfs.items():
+                        history = self.denoise_rtf_history.setdefault(str(int(channels_key)), [])
+                        history.extend(float(r) for r in rtfs)
+                        history[:] = history[-8:]  # persisted cap
+                    extra_lines = report.summary_lines() or None
+                    counts = report.counts()
+                    denoise_warning = bool(counts["failed"] or counts["skipped"]
+                                           or counts["denoised"] == 0)
+
+                self.msg_queue.put(("SPLIT_SUCCESS", (result, extra_lines, denoise_warning)))
             except InterruptedError:
                 self.msg_queue.put(("SPLIT_CANCELLED", None))
             except Exception as exc:
@@ -236,6 +300,8 @@ class App(ctk.CTk):
         """Cancel whatever background task is running."""
         if self.active_runner:
             self.active_runner.cancel()
+        if self.denoise_cancel_event:
+            self.denoise_cancel_event.set()
         if self.active_task_type == "SPLIT":
             self.split_view.set_status("جاري إلغاء العملية وتنظيف الملفات...", is_error=True)
         elif self.active_task_type == "MERGE":
@@ -248,6 +314,7 @@ class App(ctk.CTk):
             self.active_runner = None
             self.active_splitter = None
             self.active_merger = None
+            self.denoise_cancel_event = None
 
         self.split_view.set_running_state(is_busy)
         self.merge_view.set_running_state(is_busy)
@@ -262,9 +329,21 @@ class App(ctk.CTk):
                     pct, cur_sec = data
                     self.split_view.update_progress(pct, cur_sec)
 
+                elif msg_type == "DENOISE_PROGRESS":
+                    pct, message = data
+                    self.split_view.set_denoise_progress(pct, message)
+
                 elif msg_type == "SPLIT_SUCCESS":
                     self._set_app_busy(False)
-                    self.split_view.show_success_result(data)
+                    if isinstance(data, tuple) and len(data) == 3:
+                        result, extra_lines, denoise_warning = data
+                    else:
+                        result, extra_lines = data if isinstance(data, tuple) and len(data) == 2 else (data, None)
+                        denoise_warning = False
+                    self.split_view.show_success_result(
+                        result, extra_lines=extra_lines, denoise_warning=denoise_warning
+                    )
+                    self._save_settings()
 
                 elif msg_type == "SPLIT_ERROR":
                     self._set_app_busy(False)
@@ -347,4 +426,5 @@ class App(ctk.CTk):
             if self.active_thread and self.active_thread.is_alive():
                 self.active_thread.join(timeout=2.0)
 
+        self._save_settings()
         self.destroy()
