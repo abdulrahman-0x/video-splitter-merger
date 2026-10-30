@@ -19,6 +19,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+deep-filter-test/
 
 # Testing
 .pytest_cache/
@@ -44,3 +45,8 @@ tests/**/*.m4a
 # IDE
 .vscode/
 .idea/
+
+# CodeGraph index
+.codegraph/
+.codex/
+.gemini/
