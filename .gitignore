@@ -19,6 +19,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+deep-filter-test/
 
 # Testing
 .pytest_cache/
@@ -34,6 +35,7 @@ tests/**/*.mp3
 tests/**/*.flac
 tests/**/*.m4a
 *.wav
+
 # Temporary media output from tests or processing
 *.partial.*
 *_parts/
@@ -43,3 +45,8 @@ tests/**/*.m4a
 # IDE
 .vscode/
 .idea/
+
+# CodeGraph index
+.codegraph/
+.codex/
+.gemini/
