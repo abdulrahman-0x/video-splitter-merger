@@ -527,8 +527,10 @@ class SplitView(ctk.CTkFrame):
             self.denoise_strength_entry.delete(0, "end")
             self.denoise_strength_entry.insert(0, f"{float(data.get('strength_db', 12.0)):g}")
             path = data.get("deep_filter_path")
-            if path:
-                self._detect_deep_filter(str(path))
+            # Re-detect even without a saved path: detection already ran during
+            # _build_ui, but setting `enabled` above would otherwise leave the
+            # checkbox checked-and-disabled when the tool is not on PATH.
+            self._detect_deep_filter(str(path) if path else None)
             self._on_denoise_toggle()
         except Exception as exc:  # noqa: BLE001 - never fail startup over settings
             logger.warning("تعذر تطبيق الإعدادات المحفوظة: %s", exc)
@@ -584,7 +586,9 @@ class SplitView(ctk.CTkFrame):
                     is_error=True,
                 )
                 return
-            if denoise_settings["strength_db"] != denoise_settings["strength_db"] or denoise_settings["strength_db"] <= 0:
+            # Reject NaN and +/-inf here too: `denoise_wav` refuses them only
+            # after the whole split has run, so every part would fail.
+            if not (0 < denoise_settings["strength_db"] < float("inf")):
                 self.set_status(
                     "قوة تقليل الضوضاء غير صالحة: أدخل قيمة بين 1 و 100 (أو ألغِ تفعيل الخيار).",
                     is_error=True,

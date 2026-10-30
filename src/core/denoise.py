@@ -590,17 +590,19 @@ def _wait_or_cancel(proc: subprocess.Popen, state: _CancelState, poll_s: float =
 
 def _run_ffmpeg(cmd: List[str], state: _CancelState, timeout_s: float = 180.0) -> None:
     """Run a short ffmpeg step with polling-based cancellation."""
-    # Statistics lines print every ~0.5 s to stderr; drained only after exit,
-    # so silence them to keep the 64 KB pipe buffer from filling (deadlock).
     cmd = [cmd[0], "-nostats", "-loglevel", "error"] + cmd[1:]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        creationflags=CREATE_NO_WINDOW,
-    )
+    # stderr goes to a temp file, not a pipe: the pipe is only read after the
+    # child exits, so heavy error output from a damaged input would fill the
+    # 64 KB buffer and block ffmpeg until the deadline kills it.
+    err_f = tempfile.TemporaryFile()
     try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=err_f,
+            stdin=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
         deadline = time.monotonic() + timeout_s
         while True:
             rc = proc.poll()
@@ -621,16 +623,16 @@ def _run_ffmpeg(cmd: List[str], state: _CancelState, timeout_s: float = 180.0) -
                 proc.kill()
                 raise DenoiseError(f"انتهت المدة المسموحة لأداة ffmpeg: {' '.join(cmd[:3])}...")
             time.sleep(0.1)
+        if rc != 0:
+            err = b""
+            try:
+                err_f.seek(0)
+                err = err_f.read()
+            except Exception:
+                pass
+            raise DenoiseError(f"فشل أمر ffmpeg أثناء تقليل الضوضاء (رمز {rc}).\n{err.decode('utf-8', 'replace')[-800:]}")
     finally:
-        if proc.stderr:
-            proc.stderr.close()
-    if rc != 0:
-        err = b""
-        try:
-            err = proc.stderr.read() if proc.stderr else b""
-        except Exception:
-            pass
-        raise DenoiseError(f"فشل أمر ffmpeg أثناء تقليل الضوضاء (رمز {rc}).\n{err.decode('utf-8', 'replace')[-800:]}")
+        err_f.close()
 
 
 # ---------------------------------------------------------------------------
@@ -939,16 +941,18 @@ DUAL_MONO_WINDOW_SECONDS = 5.0
 
 
 def channel_residual_db(ffmpeg: str | Path, src: Path, start_s: float, dur_s: float,
-                        state: _CancelState) -> Optional[float]:
+                        state: _CancelState, stream_index: int = 0) -> Optional[float]:
     """L-R residual level relative to the mid signal over one window, in dB.
 
     Returns None when the window has no measurable mid level (silence), which the
-    caller must treat as "not provably dual-mono".
+    caller must treat as "not provably dual-mono". `stream_index` selects which
+    audio stream is measured; the unindexed `[0:a]` label would always measure
+    the first stream.
     """
     def rms_of(pan: str) -> Optional[float]:
         c = [str(ffmpeg), "-nostdin", "-v", "info", "-i", str(src),
              "-filter_complex",
-             f"[0:a]atrim=start={start_s:.3f}:duration={dur_s:.3f},asetpts=N/SR/TB,"
+             f"[0:a:{stream_index}]atrim=start={start_s:.3f}:duration={dur_s:.3f},asetpts=N/SR/TB,"
              f"{pan},astats=metadata=1:reset=0[o]",
              "-map", "[o]", "-f", "null", "-"]
         p = subprocess.run(c, capture_output=True, stdin=subprocess.DEVNULL,
@@ -976,18 +980,32 @@ def channel_residual_db(ffmpeg: str | Path, src: Path, start_s: float, dur_s: fl
 
 
 def is_dual_mono(ffmpeg: str | Path, src: Path, channels: int, duration_s: float,
-                 state: _CancelState) -> Tuple[bool, Optional[float]]:
+                 state: _CancelState, stream_index: int = 0) -> Tuple[bool, Optional[float]]:
     """(is_dual_mono, worst residual dB). Only for exactly 2 channels."""
     if channels != 2 or duration_s <= 0:
         return False, None
     n = DUAL_MONO_MAX_WINDOWS
     win = min(DUAL_MONO_WINDOW_SECONDS, max(1.0, duration_s / n))
+    # The sampled windows only cover n * win seconds. On a longer part the
+    # unchecked gaps can hold real stereo content, and a false positive would
+    # downmix the whole part irreversibly, so measure the full duration in one
+    # pass when the windows cannot cover it. RMS energy accumulates, so even a
+    # short stereo passage raises the residual.
+    covered = n * win
+    spans: List[Tuple[float, float]] = (
+        [(0.0, duration_s)] if covered + 1e-6 < duration_s else
+        [
+            (
+                max(0.0, min(i * (duration_s - win) / max(1, n - 1), max(0.0, duration_s - win))),
+                win,
+            )
+            for i in range(n)
+        ]
+    )
     worst: Optional[float] = None
-    for i in range(n):
-        start = i * (duration_s - win) / max(1, n - 1) if n > 1 else 0.0
-        start = max(0.0, min(start, max(0.0, duration_s - win)))
+    for start, span in spans:
         try:
-            res = channel_residual_db(ffmpeg, src, start, win, state)
+            res = channel_residual_db(ffmpeg, src, start, span, state, stream_index)
         except InterruptedError:
             raise
         except Exception as exc:  # noqa: BLE001 - never fail the run for a probe
@@ -1160,8 +1178,28 @@ def _remux_part_with_denoised_audio(
     the source with `-c copy`.
     """
     info = probe_media(part, ffprobe_path=Path(ffprobe))
+    audio_streams = info.get("audio_streams", [])
+    try:
+        container_start = float(
+            (info.get("raw") or {}).get("format", {}).get("start_time") or 0.0
+        )
+    except (TypeError, ValueError):
+        container_start = 0.0
     cmd: List[str] = [str(ffmpeg), "-nostdin", "-y", "-i", str(part)]
-    for wav in denoised:
+    for idx, wav in enumerate(denoised):
+        # A WAV carries no timestamp, so `_extract_audio_stream` rebases the
+        # stream to its first sample. A part whose audio starts after its video
+        # would lose that offset and play early; restore it on the input.
+        # The offset is relative to the container start so a container-level
+        # offset (MPEG-TS) that shifts every stream is not re-applied.
+        try:
+            raw_start = audio_streams[idx].get("start_time") if idx < len(audio_streams) else 0.0
+            audio_start = float(raw_start or 0.0)
+        except (TypeError, ValueError):
+            audio_start = 0.0
+        offset = audio_start - container_start
+        if offset > 1e-6:
+            cmd += ["-itsoffset", f"{offset:.6f}"]
         cmd += ["-i", str(wav)]
 
     # Walk the original streams in order and substitute audio payloads.
@@ -1181,10 +1219,14 @@ def _remux_part_with_denoised_audio(
                     if str(key).lower() in ("encoder", "duration", "duration-ms"):
                         continue
                     meta_args += [f"-metadata:s:a:{out_audio_idx}", f"{key}={value}"]
-                disp = stream.get("disposition") or {}
-                for key, value in disp.items():
-                    if value:
-                        meta_args += [f"-disposition:a:{out_audio_idx}", key]
+                # -disposition REPLACES a stream's whole disposition, so one
+                # option per flag keeps only the last one. Join them with '+'.
+                disp_flags = [
+                    str(key) for key, value in (stream.get("disposition") or {}).items()
+                    if value
+                ]
+                if disp_flags:
+                    meta_args += [f"-disposition:a:{out_audio_idx}", "+".join(disp_flags)]
                 out_audio_idx += 1
             else:
                 cmd += ["-map", f"0:{idx}"]
@@ -1367,6 +1409,11 @@ def denoise_parts(
     total_audio_seconds = sum(max(0.0, float(dur or 0.0)) for _p, dur in parts)
     done_seconds_lock = threading.Lock()
     done_seconds = {"value": 0.0}
+    # RAM admitted but not yet released, in MB. Each worker subtracts it from the
+    # free RAM it measures so two admitted parts cannot both spend the same
+    # memory before either process has allocated it (WP2, workers=2).
+    ram_reserved_mb = {"value": 0}
+    ram_reserve_lock = threading.Lock()
 
     def _report_progress() -> None:
         if progress_callback and total_audio_seconds > 0:
@@ -1377,6 +1424,7 @@ def denoise_parts(
 
     def _process_part(part: Path, dur: float) -> DenoisePartStatus:
         t_part = time.perf_counter()
+        reserved_mb = 0
         try:
             state.check(_CANCEL_MSG)
             info = probe_media(part, ffprobe_path=ffprobe_bin)
@@ -1388,21 +1436,28 @@ def denoise_parts(
             if state.cancelled:
                 raise InterruptedError(_CANCEL_MSG)
 
-            # WP3: dual-mono detection (only meaningful for exactly 2 channels).
+            # WP3: dual-mono detection is per audio stream (below). The RAM
+            # estimate keeps the worst case (every stream at full width) because
+            # the per-stream verdict is not known before the probe runs.
             shortcut_on = bool(settings.get("denoise_dual_mono_shortcut", True))
             dual = False
             residual_db: Optional[float] = None
-            if shortcut_on and src_channels == 2:
-                dual, residual_db = is_dual_mono(ffmpeg_bin, part, src_channels, effective_dur, state)
-            eff_channels = 1 if dual else src_channels
+            eff_channels = src_channels
 
-            admitted, est, limit = guard_admits(effective_dur, eff_channels)
+            with ram_reserve_lock:
+                avail_now = get_available_ram_mb()
+                if avail_now is not None:
+                    avail_now = max(0, int(avail_now) - ram_reserved_mb["value"])
+                admitted, est, limit = guard_admits(effective_dur, eff_channels, avail_now)
+                if admitted:
+                    ram_reserved_mb["value"] += est
+            reserved_mb = est if admitted else 0
             logger.info(
                 "حارس الذاكرة: الجزء %s مدة %.1f ث، قنوات فعالة %d%s، التقدير %.0f MB، "
                 "الحد %d MB، المتاح %s MB -> %s",
                 part.name, effective_dur, eff_channels,
                 f" (ثنائي القناة متطابق، المتبقي {residual_db:.1f} dB)" if dual else "",
-                est, limit, get_available_ram_mb(), "مقبول" if admitted else "مرفوض",
+                est, limit, avail_now, "مقبول" if admitted else "مرفوض",
             )
             if not admitted:
                 return DenoisePartStatus(
@@ -1430,8 +1485,24 @@ def denoise_parts(
                     codec_name = str(stream.get("codec_name") or "pcm_s16le")
                     encoder = _encoder_for(codec_name)
                     bitrate = _bitrate_for_stream(stream, info)
-                    # WP3: denoise the mono downmix, then restore the layout below.
-                    stream_dual = dual and int(stream.get("channels") or 1) == 2
+                    # WP3: classify THIS stream. A part-level verdict would
+                    # downmix a genuinely stereo stream that merely shares the
+                    # part with a dual-mono one.
+                    stream_channels = int(stream.get("channels") or 1)
+                    stream_dual = False
+                    if shortcut_on and stream_channels == 2:
+                        stream_dual, stream_residual = is_dual_mono(
+                            ffmpeg_bin, part, stream_channels, effective_dur, state,
+                            stream_index=idx,
+                        )
+                        if stream_dual:
+                            dual = True
+                            if stream_residual is not None:
+                                residual_db = (
+                                    stream_residual if residual_db is None
+                                    else min(residual_db, stream_residual)
+                                )
+                            eff_channels = 1
                     try:
                         denoise_result = denoise_wav(
                             src_stream, dst_stream,
@@ -1481,6 +1552,12 @@ def denoise_parts(
             logger.exception("خطأ غير متوقع أثناء تقليل ضوضاء الجزء %s: %s", part.name, exc)
             return DenoisePartStatus(part=part, ok=False, reason=f"خطأ غير متوقع: {exc}",
                                      wall_s=round(time.perf_counter() - t_part, 2))
+        finally:
+            # Release this part's reservation on every exit path so a refused,
+            # skipped, failed or cancelled part never leaks its RAM estimate.
+            if reserved_mb:
+                with ram_reserve_lock:
+                    ram_reserved_mb["value"] = max(0, ram_reserved_mb["value"] - reserved_mb)
 
     def _worker(items: Sequence[Tuple[Path, float]]) -> None:
         for part, dur in items:
